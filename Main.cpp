@@ -31,27 +31,27 @@ static constexpr size_t roundUp4(size_t N) {
 
 class Buffer {
 public:
-  explicit Buffer() : Data{}, Position{0} {}
-  explicit Buffer(const std::vector<char> &Data) : Data{Data}, Position{0} {}
+  explicit Buffer() : Data{}, Pos{0} {}
+  explicit Buffer(const std::vector<char> &Data) : Data{Data}, Pos{0} {}
 
   template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
   void write(T Value) {
-    assert(Position % alignof(T) == 0);
+    assert(Pos % alignof(T) == 0);
 
     size_t OldSize = Data.size();
     Data.resize(OldSize + sizeof(T));
     std::memcpy(Data.data() + OldSize, &Value, sizeof(T));
-    Position += sizeof(T);
+    Pos += sizeof(T);
   }
 
   template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
   T read() {
-    assert(Position + sizeof(T) <= Data.size());
-    assert(Position % alignof(T) == 0);
+    assert(Pos + sizeof(T) <= Data.size());
+    assert(Pos % alignof(T) == 0);
 
     T Value;
-    std::memcpy(&Value, Data.data() + Position, sizeof(T));
-    Position += sizeof(T);
+    std::memcpy(&Value, Data.data() + Pos, sizeof(T));
+    Pos += sizeof(T);
     return Value;
   }
 
@@ -62,26 +62,26 @@ public:
     size_t PaddedLen = roundUp4(Str.size());
     size_t OldSize = Data.size();
     Data.resize(OldSize + PaddedLen, '\0');
-    std::memcpy(Data.data() + Position, Str.data(), Str.size());
-    Position += PaddedLen;
+    std::memcpy(Data.data() + Pos, Str.data(), Str.size());
+    Pos += PaddedLen;
   }
 
   std::string readString() {
     uint32_t Len = read<uint32_t>();
-    assert(Position + Len <= Data.size());
+    assert(Pos + Len <= Data.size());
 
-    std::string Result{Data.data() + Position, Len};
-    Position += roundUp4(Len);
+    std::string Result{Data.data() + Pos, Len};
+    Pos += roundUp4(Len);
     return Result;
   }
 
   const char *data() const { return Data.data(); }
   size_t size() const { return Data.size(); }
-  size_t position() const { return Position; }
+  size_t position() const { return Pos; }
 
 private:
   std::vector<char> Data;
-  size_t Position;
+  size_t Pos;
 };
 } // namespace Utils
 
