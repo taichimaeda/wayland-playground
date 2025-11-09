@@ -46,7 +46,7 @@ public:
   explicit Buffer(const std::vector<char> &Data) : Data{Data}, Pos{0} {}
 
   template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
-  void write(T Value) {
+  void writeUint(T Value) {
     assert(Pos % alignof(T) == 0);
 
     size_t OldSize = Data.size();
@@ -56,7 +56,7 @@ public:
   }
 
   template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
-  T read() {
+  T readUint() {
     assert(Pos + sizeof(T) <= Data.size());
     assert(Pos % alignof(T) == 0);
 
@@ -67,8 +67,8 @@ public:
   }
 
   void writeString(std::string_view Str) {
-    // write length first for Wayland protocol
-    write(static_cast<uint32_t>(Str.size()));
+    // write length first as per Wayland protocol
+    writeUint(static_cast<uint32_t>(Str.size()));
 
     size_t PaddedLen = roundUp4(Str.size());
     size_t OldSize = Data.size();
@@ -78,7 +78,7 @@ public:
   }
 
   std::string readString() {
-    uint32_t Len = read<uint32_t>();
+    uint32_t Len = readUint<uint32_t>();
     assert(Pos + Len <= Data.size());
 
     std::string Result{Data.data() + Pos, Len};
@@ -88,7 +88,7 @@ public:
 
   const char *data() const { return Data.data(); }
   size_t size() const { return Data.size(); }
-  size_t position() const { return Pos; }
+  size_t pos() const { return Pos; }
 
 private:
   std::vector<char> Data;
@@ -133,6 +133,7 @@ public:
   void connect();
   void getRegistry();
   void createSharedMemoryFile(size_t Size);
+  void handleMessage(Utils::Buffer &Msg);
 
 private:
   int Fd = -1;
@@ -203,23 +204,25 @@ void Display::connect() {
 
 void Display::getRegistry() {
   Utils::Buffer Msg;
-  Msg.write(DisplayObjectId);
-  Msg.write(WlDisplayGetRegistryOpcode);
+  Msg.writeUint(DisplayObjectId);
+  Msg.writeUint(WlDisplayGetRegistryOpcode);
 
   // message size (part of header)
-  uint16_t MsgAnnouncedSize = HeaderSize + sizeof(CurrentId);
-  assert(Utils::roundUp4(MsgAnnouncedSize) == MsgAnnouncedSize);
-  Msg.write(MsgAnnouncedSize);
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentId);
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
 
   // argument to get_registry
   CurrentId++;
-  Msg.write(CurrentId);
+  Msg.writeUint(CurrentId);
 
   // send message
   ssize_t Sent = send(Fd, Msg.data(), Msg.size(), MSG_DONTWAIT);
   if (static_cast<size_t>(Sent) != Msg.size())
     throw std::system_error(errno, std::generic_category(),
                             "failed to send get_registry message");
+
+  WlRegistry = CurrentId;
 }
 
 void Display::createSharedMemoryFile(size_t Size) {
@@ -265,6 +268,29 @@ void Display::createSharedMemoryFile(size_t Size) {
   }
 
   ShmPoolSize = Size;
+}
+
+void Display::handleMessage(Utils::Buffer &Msg) {
+  assert(Msg.size() >= 8);
+
+  // read header
+  uint32_t ObjectId = Msg.readUint<uint32_t>();
+  assert(ObjectId <= CurrentId);
+
+  uint16_t Opcode = Msg.readUint<uint16_t>();
+  uint16_t MsgSizeAnnounced = Msg.readUint<uint16_t>();
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+
+  // verify message size
+  uint32_t HeaderSize = sizeof(ObjectId) + sizeof(Opcode) + sizeof(MsgSizeAnnounced);
+  uint32_t MsgSize = HeaderSize + (Msg.size() - Msg.pos());
+  assert(MsgSizeAnnounced <= MsgSize);
+
+  // dispatch based on object and opcode
+  if (ObjectId == WlRegistry && Opcode == WlRegistryEventGlobal) {
+    // TODO: handle registry global event
+  }
+  // TODO: add more event handlers
 }
 } // namespace Wayland
 
