@@ -66,6 +66,7 @@ public:
     return Value;
   }
 
+  // TODO: check if this handles null terminator correctly
   void writeString(std::string_view Str) {
     // write length first as per Wayland protocol
     writeUint(static_cast<uint32_t>(Str.size()));
@@ -77,8 +78,8 @@ public:
     Pos += PaddedLen;
   }
 
-  std::string readString() {
-    uint32_t Len = readUint<uint32_t>();
+  // TODO: check if this handles null terminator correctly
+  std::string readString(uint32_t Len) {
     assert(Pos + Len <= Data.size());
 
     std::string Result{Data.data() + Pos, Len};
@@ -131,11 +132,18 @@ enum class Status {
 class Display {
 public:
   void connect();
-  void getRegistry();
-  void createSharedMemoryFile(size_t Size);
+  void allocate(size_t Size);
+
+  void sendGetRegistry();
+  uint32_t sendRegistryBind(uint32_t Name, std::string_view Interface,
+                            uint32_t InterfaceLen, uint32_t Version);
+
   void handleMessage(Utils::Buffer &Msg);
 
 private:
+  void handleRegistryGlobal(Utils::Buffer &Msg, uint16_t MsgSizeAnnounced);
+  void handleDisplayError(Utils::Buffer &Msg);
+
   int Fd = -1;
   uint32_t CurrentId = 1;
   std::string XdgRuntimeDir;
@@ -202,30 +210,7 @@ void Display::connect() {
   }
 }
 
-void Display::getRegistry() {
-  Utils::Buffer Msg;
-  Msg.writeUint(DisplayObjectId);
-  Msg.writeUint(WlDisplayGetRegistryOpcode);
-
-  // message size (part of header)
-  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentId);
-  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
-  Msg.writeUint(MsgSizeAnnounced);
-
-  // argument to get_registry
-  CurrentId++;
-  Msg.writeUint(CurrentId);
-
-  // send message
-  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), MSG_DONTWAIT);
-  if (static_cast<size_t>(Sent) != Msg.size())
-    throw std::system_error(errno, std::generic_category(),
-                            "failed to send get_registry message");
-
-  WlRegistry = CurrentId;
-}
-
-void Display::createSharedMemoryFile(size_t Size) {
+void Display::allocate(size_t Size) {
   // create shared memory file
   // O_RDWR for read/write
   // O_EXCL | O_CREAT to ensure a new file is always created
@@ -270,6 +255,64 @@ void Display::createSharedMemoryFile(size_t Size) {
   ShmPoolSize = Size;
 }
 
+void Display::sendGetRegistry() {
+  Utils::Buffer Msg;
+  Msg.writeUint(DisplayObjectId);
+  Msg.writeUint(WlDisplayGetRegistryOpcode);
+
+  // message size (part of header)
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentId);
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // argument to get_registry
+  CurrentId++;
+  Msg.writeUint(CurrentId);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), MSG_DONTWAIT);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send get_registry message");
+
+  WlRegistry = CurrentId;
+}
+
+uint32_t Display::sendRegistryBind(uint32_t Name, std::string_view Interface,
+                                   uint32_t InterfaceLen, uint32_t Version) {
+  Utils::Buffer Msg;
+  Msg.writeUint(WlRegistry);
+  Msg.writeUint(WlRegistryBindOpcode);
+
+  // calculate message size
+  uint32_t PaddedInterfaceLen = Utils::roundUp4(InterfaceLen);
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(Name) + sizeof(InterfaceLen) +
+                              PaddedInterfaceLen + sizeof(Version) +
+                              sizeof(CurrentId);
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // write bind arguments
+  Msg.writeUint(Name);
+  Msg.writeString(Interface);
+  Msg.writeUint(Version);
+
+  // allocate new object id and write it
+  CurrentId++;
+  Msg.writeUint(CurrentId);
+
+  // verify buffer size is aligned
+  assert(Msg.size() == Utils::roundUp4(Msg.size()));
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send registry bind message");
+
+  return CurrentId;
+}
+
 void Display::handleMessage(Utils::Buffer &Msg) {
   assert(Msg.size() >= 8);
 
@@ -282,15 +325,53 @@ void Display::handleMessage(Utils::Buffer &Msg) {
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
 
   // verify message size
-  uint32_t HeaderSize = sizeof(ObjectId) + sizeof(Opcode) + sizeof(MsgSizeAnnounced);
+  uint32_t HeaderSize =
+      sizeof(ObjectId) + sizeof(Opcode) + sizeof(MsgSizeAnnounced);
   uint32_t MsgSize = HeaderSize + (Msg.size() - Msg.pos());
   assert(MsgSizeAnnounced <= MsgSize);
 
   // dispatch based on object and opcode
   if (ObjectId == WlRegistry && Opcode == WlRegistryEventGlobal) {
-    // TODO: handle registry global event
+    handleRegistryGlobal(Msg, MsgSizeAnnounced);
+  } else if (ObjectId == DisplayObjectId && Opcode == WlDisplayErrorEvent) {
+    handleDisplayError(Msg);
   }
   // TODO: add more event handlers
+}
+
+void Display::handleRegistryGlobal(Utils::Buffer &Msg,
+                                   uint16_t MsgSizeAnnounced) {
+  uint32_t Name = Msg.readUint<uint32_t>();
+  uint32_t InterfaceLen = Msg.readUint<uint32_t>();
+  std::string Interface = Msg.readString(InterfaceLen);
+  uint32_t Version = Msg.readUint<uint32_t>();
+
+  // verify message size
+  uint32_t PaddedInterfaceLen = Utils::roundUp4(Interface.size() + 1);
+  assert(MsgSizeAnnounced == HeaderSize + sizeof(Name) + sizeof(uint32_t) +
+                                 PaddedInterfaceLen + sizeof(Version));
+
+  // bind interfaces we need
+  if (Interface == "wl_shm") {
+    WlShm = sendRegistryBind(Name, Interface, Interface.size() + 1, Version);
+  } else if (Interface == "xdg_wm_base") {
+    XdgWmBase =
+        sendRegistryBind(Name, Interface, Interface.size() + 1, Version);
+  } else if (Interface == "wl_compositor") {
+    WlCompositor =
+        sendRegistryBind(Name, Interface, Interface.size() + 1, Version);
+  }
+}
+
+void Display::handleDisplayError(Utils::Buffer &Msg) {
+  uint32_t TargetObjectId = Msg.readUint<uint32_t>();
+  uint32_t Code = Msg.readUint<uint32_t>();
+  uint32_t ErrorLen = Msg.readUint<uint32_t>();
+  std::string Error = Msg.readString(ErrorLen);
+
+  throw std::runtime_error("fatal wayland error: target_object_id=" +
+                           std::to_string(TargetObjectId) +
+                           " code=" + std::to_string(Code) + " error=" + Error);
 }
 } // namespace Wayland
 
