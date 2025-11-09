@@ -29,6 +29,17 @@ static constexpr size_t roundUp4(size_t N) {
   return (N + 3) & Mask;
 }
 
+static std::string generateRandomString(size_t Len) {
+  std::string Result;
+  Result.reserve(Len);
+  for (size_t I = 0; I < Len; ++I) {
+    Result += static_cast<char>(static_cast<double>(std::rand()) /
+                                    static_cast<double>(RAND_MAX) * 26 +
+                                'a');
+  }
+  return Result;
+}
+
 class Buffer {
 public:
   explicit Buffer() : Data{}, Pos{0} {}
@@ -87,31 +98,6 @@ private:
 
 namespace Wayland {
 
-enum class Status {
-  None,
-  SurfaceAckedConfigure,
-  SurfaceAttached,
-};
-
-struct State {
-  uint32_t WlRegistry{};
-  uint32_t WlShm{};
-  uint32_t WlShmPool{};
-  uint32_t WlBuffer{};
-  uint32_t XdgWmBase{};
-  uint32_t XdgSurface{};
-  uint32_t WlCompositor{};
-  uint32_t WlSurface{};
-  uint32_t XdgToplevel{};
-  uint32_t Stride{};
-  uint32_t Width{};
-  uint32_t Height{};
-  uint32_t ShmPoolSize{};
-  int ShmFd{-1};
-  uint8_t *ShmPoolData{nullptr};
-  Status CurrentStatus{Status::None};
-};
-
 static constexpr uint32_t DisplayObjectId = 1;
 static constexpr uint16_t WlRegistryEventGlobal = 0;
 static constexpr uint16_t ShmPoolEventFormat = 0;
@@ -136,19 +122,45 @@ static constexpr uint32_t FormatXrgb8888 = 1;
 static constexpr uint32_t HeaderSize = 8;
 static constexpr uint32_t ColorChannels = 4;
 
+enum class Status {
+  None,
+  SurfaceAckedConfigure,
+  SurfaceAttached,
+};
+
 class Display {
 public:
   void connect();
   void getRegistry();
-
-  int getFd() const { return Fd; }
-  uint32_t getCurrentId() const { return CurrentId; }
+  void createSharedMemoryFile(size_t Size);
 
 private:
   int Fd = -1;
   uint32_t CurrentId = 1;
   std::string XdgRuntimeDir;
   std::string DisplayName;
+
+  // TODO: extract into separate class
+  // Wayland objects
+  uint32_t WlRegistry{};
+  uint32_t WlShm{};
+  uint32_t WlShmPool{};
+  uint32_t WlBuffer{};
+  uint32_t XdgWmBase{};
+  uint32_t XdgSurface{};
+  uint32_t WlCompositor{};
+  uint32_t WlSurface{};
+  uint32_t XdgToplevel{};
+  Status CurrentStatus{Status::None};
+
+  // TODO: extract into separate class
+  // shared memory state
+  uint32_t Stride{};
+  uint32_t Width{};
+  uint32_t Height{};
+  uint32_t ShmPoolSize{};
+  int ShmFd{-1};
+  uint8_t *ShmPoolData{nullptr};
 };
 
 void Display::connect() {
@@ -208,6 +220,51 @@ void Display::getRegistry() {
   if (static_cast<size_t>(Sent) != Msg.size())
     throw std::system_error(errno, std::generic_category(),
                             "failed to send get_registry message");
+}
+
+void Display::createSharedMemoryFile(size_t Size) {
+  // create shared memory file
+  // O_RDWR for read/write
+  // O_EXCL | O_CREAT to ensure a new file is always created
+  std::string Name = "/" + Utils::generateRandomString(253);
+  ShmFd = shm_open(Name.c_str(), O_RDWR | O_EXCL | O_CREAT, 0600);
+  if (ShmFd == -1)
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to create shared memory");
+
+  // unlink immediately for clean up on exit
+  if (shm_unlink(Name.c_str()) == -1) {
+    int SavedErrno = errno;
+    close(ShmFd);
+    ShmFd = -1;
+    throw std::system_error(SavedErrno, std::generic_category(),
+                            "failed to unlink shared memory");
+  }
+
+  // set size
+  if (ftruncate(ShmFd, Size) == -1) {
+    int SavedErrno = errno;
+    close(ShmFd);
+    ShmFd = -1;
+    throw std::system_error(SavedErrno, std::generic_category(),
+                            "failed to truncate shared memory");
+  }
+
+  // map memory
+  // PROT_READ | PROT_WRITE for read/write
+  // MAP_SHARED for sharing with compositor process
+  ShmPoolData = static_cast<uint8_t *>(
+      mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_SHARED, ShmFd, 0));
+  if (ShmPoolData == MAP_FAILED) {
+    int SavedErrno = errno;
+    close(ShmFd);
+    ShmFd = -1;
+    ShmPoolData = nullptr;
+    throw std::system_error(SavedErrno, std::generic_category(),
+                            "failed to map shared memory");
+  }
+
+  ShmPoolSize = Size;
 }
 } // namespace Wayland
 
