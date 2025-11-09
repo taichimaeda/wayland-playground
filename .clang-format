@@ -1,0 +1,3 @@
+# Copied from the LLVM project
+BasedOnStyle: LLVM
+LineEnding: LF
