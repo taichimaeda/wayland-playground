@@ -87,6 +87,31 @@ private:
 
 namespace Wayland {
 
+enum class Status {
+  None,
+  SurfaceAckedConfigure,
+  SurfaceAttached,
+};
+
+struct State {
+  uint32_t WlRegistry{};
+  uint32_t WlShm{};
+  uint32_t WlShmPool{};
+  uint32_t WlBuffer{};
+  uint32_t XdgWmBase{};
+  uint32_t XdgSurface{};
+  uint32_t WlCompositor{};
+  uint32_t WlSurface{};
+  uint32_t XdgToplevel{};
+  uint32_t Stride{};
+  uint32_t Width{};
+  uint32_t Height{};
+  uint32_t ShmPoolSize{};
+  int ShmFd{-1};
+  uint8_t *ShmPoolData{nullptr};
+  Status CurrentStatus{Status::None};
+};
+
 static constexpr uint32_t DisplayObjectId = 1;
 static constexpr uint16_t WlRegistryEventGlobal = 0;
 static constexpr uint16_t ShmPoolEventFormat = 0;
