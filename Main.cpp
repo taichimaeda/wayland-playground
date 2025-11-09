@@ -131,12 +131,23 @@ enum class Status {
 
 class Display {
 public:
+  // TODO: add destructor
+  // TODO: prohibit copy/move
   void connect();
   void allocate(size_t Size);
 
-  void sendGetRegistry();
-  uint32_t sendRegistryBind(uint32_t Name, std::string_view Interface,
-                            uint32_t InterfaceLen, uint32_t Version);
+  uint32_t wlGetRegistry();
+  uint32_t wlRegistryBind(uint32_t Name, std::string_view Interface,
+                          uint32_t InterfaceLen, uint32_t Version);
+  uint32_t wlCompositorCreateSurface();
+  uint32_t wlShmCreatePool();
+  uint32_t wlXdgWmBaseGetXdgSurface();
+  uint32_t wlShmPoolCreateBuffer();
+  void wlSurfaceAttach();
+  void wlSurfaceCommit();
+  uint32_t wlXdgSurfaceGetToplevel();
+  void wlXdgWmBasePong(uint32_t Ping);
+  void wlXdgSurfaceAckConfigure(uint32_t Configure);
 
   void handleMessage(Utils::Buffer &Msg);
 
@@ -255,7 +266,7 @@ void Display::allocate(size_t Size) {
   ShmPoolSize = Size;
 }
 
-void Display::sendGetRegistry() {
+uint32_t Display::wlGetRegistry() {
   Utils::Buffer Msg;
   Msg.writeUint(DisplayObjectId);
   Msg.writeUint(WlDisplayGetRegistryOpcode);
@@ -275,11 +286,11 @@ void Display::sendGetRegistry() {
     throw std::system_error(errno, std::generic_category(),
                             "failed to send get_registry message");
 
-  WlRegistry = CurrentId;
+  return CurrentId;
 }
 
-uint32_t Display::sendRegistryBind(uint32_t Name, std::string_view Interface,
-                                   uint32_t InterfaceLen, uint32_t Version) {
+uint32_t Display::wlRegistryBind(uint32_t Name, std::string_view Interface,
+                                 uint32_t InterfaceLen, uint32_t Version) {
   Utils::Buffer Msg;
   Msg.writeUint(WlRegistry);
   Msg.writeUint(WlRegistryBindOpcode);
@@ -313,6 +324,264 @@ uint32_t Display::sendRegistryBind(uint32_t Name, std::string_view Interface,
   return CurrentId;
 }
 
+uint32_t Display::wlCompositorCreateSurface() {
+  assert(WlCompositor > 0);
+
+  Utils::Buffer Msg;
+  Msg.writeUint(WlCompositor);
+  Msg.writeUint(WlCompositorCreateSurfaceOpcode);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentId);
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // allocate new object id and write it
+  CurrentId++;
+  Msg.writeUint(CurrentId);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send compositor create_surface message");
+
+  return CurrentId;
+}
+
+// TODO: revisit this method
+uint32_t Display::wlShmCreatePool() {
+  assert(ShmPoolSize > 0);
+
+  Utils::Buffer Msg;
+  Msg.writeUint(WlShm);
+  Msg.writeUint(WlShmCreatePoolOpcode);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced =
+      HeaderSize + sizeof(CurrentId) + sizeof(ShmPoolSize);
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // allocate new object id and write it
+  CurrentId++;
+  Msg.writeUint(CurrentId);
+
+  // write pool size
+  Msg.writeUint(ShmPoolSize);
+
+  assert(Msg.size() == Utils::roundUp4(Msg.size()));
+
+  // send the file descriptor as ancillary data
+  char Buf[CMSG_SPACE(sizeof(ShmFd))]{};
+
+  struct iovec Io = {.iov_base = const_cast<char *>(Msg.data()),
+                     .iov_len = Msg.size()};
+  struct msghdr SocketMsg = {
+      .msg_name = nullptr,
+      .msg_namelen = 0,
+      .msg_iov = &Io,
+      .msg_iovlen = 1,
+      .msg_control = Buf,
+      .msg_controllen = sizeof(Buf),
+  };
+
+  struct cmsghdr *Cmsg = CMSG_FIRSTHDR(&SocketMsg);
+  Cmsg->cmsg_level = SOL_SOCKET;
+  Cmsg->cmsg_type = SCM_RIGHTS;
+  Cmsg->cmsg_len = CMSG_LEN(sizeof(ShmFd));
+
+  *reinterpret_cast<int *>(CMSG_DATA(Cmsg)) = ShmFd;
+  SocketMsg.msg_controllen = CMSG_SPACE(sizeof(ShmFd));
+
+  if (sendmsg(Fd, &SocketMsg, 0) == -1)
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send wl_shm create_pool message");
+
+  return CurrentId;
+}
+
+uint32_t Display::wlXdgWmBaseGetXdgSurface() {
+  assert(XdgWmBase > 0);
+  assert(WlSurface > 0);
+
+  Utils::Buffer Msg;
+  Msg.writeUint(XdgWmBase);
+  Msg.writeUint(XdgWmBaseGetXdgSurfaceOpcode);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced =
+      HeaderSize + sizeof(CurrentId) + sizeof(WlSurface);
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // allocate new object id and write it
+  CurrentId++;
+  Msg.writeUint(CurrentId);
+
+  // write wl_surface argument
+  Msg.writeUint(WlSurface);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(
+        errno, std::generic_category(),
+        "failed to send xdg_wm_base get_xdg_surface message");
+
+  return CurrentId;
+}
+
+uint32_t Display::wlShmPoolCreateBuffer() {
+  assert(WlShmPool > 0);
+
+  Utils::Buffer Msg;
+  Msg.writeUint(WlShmPool);
+  Msg.writeUint(WlShmPoolCreateBufferOpcode);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced =
+      HeaderSize + sizeof(CurrentId) + sizeof(uint32_t) * 5;
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // allocate new object id and write it
+  CurrentId++;
+  Msg.writeUint(CurrentId);
+
+  // write buffer parameters
+  uint32_t Offset = 0;
+  Msg.writeUint(Offset);
+  Msg.writeUint(Width);
+  Msg.writeUint(Height);
+  Msg.writeUint(Stride);
+  Msg.writeUint(FormatXrgb8888);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send wl_shm_pool create_buffer message");
+
+  return CurrentId;
+}
+
+void Display::wlSurfaceAttach() {
+  assert(WlSurface > 0);
+  assert(WlBuffer > 0);
+
+  Utils::Buffer Msg;
+  Msg.writeUint(WlSurface);
+  Msg.writeUint(WlSurfaceAttachOpcode);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced =
+      HeaderSize + sizeof(WlBuffer) + sizeof(uint32_t) * 2;
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // write buffer and position
+  Msg.writeUint(WlBuffer);
+  uint32_t X = 0, Y = 0;
+  Msg.writeUint(X);
+  Msg.writeUint(Y);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send wl_surface attach message");
+}
+
+void Display::wlSurfaceCommit() {
+  assert(WlSurface > 0);
+
+  Utils::Buffer Msg;
+  Msg.writeUint(WlSurface);
+  Msg.writeUint(WlSurfaceCommitOpcode);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced = HeaderSize;
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send wl_surface commit message");
+}
+
+uint32_t Display::wlXdgSurfaceGetToplevel() {
+  assert(XdgSurface > 0);
+
+  Utils::Buffer Msg;
+  Msg.writeUint(XdgSurface);
+  Msg.writeUint(XdgSurfaceGetToplevelOpcode);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentId);
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // allocate new object id and write it
+  CurrentId++;
+  Msg.writeUint(CurrentId);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send xdg_surface get_toplevel message");
+
+  return CurrentId;
+}
+
+void Display::wlXdgWmBasePong(uint32_t Ping) {
+  assert(XdgWmBase > 0);
+  assert(WlSurface > 0);
+
+  Utils::Buffer Msg;
+  Msg.writeUint(XdgWmBase);
+  Msg.writeUint(XdgWmBasePongOpcode);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(Ping);
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // write ping argument
+  Msg.writeUint(Ping);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send xdg_wm_base pong message");
+}
+
+void Display::wlXdgSurfaceAckConfigure(uint32_t Configure) {
+  assert(XdgSurface > 0);
+
+  Utils::Buffer Msg;
+  Msg.writeUint(XdgSurface);
+  Msg.writeUint(XdgSurfaceAckConfigureOpcode);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(Configure);
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // write configure argument
+  Msg.writeUint(Configure);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send xdg_surface ack_configure message");
+}
+
 void Display::handleMessage(Utils::Buffer &Msg) {
   assert(Msg.size() >= 8);
 
@@ -335,8 +604,9 @@ void Display::handleMessage(Utils::Buffer &Msg) {
     handleRegistryGlobal(Msg, MsgSizeAnnounced);
   } else if (ObjectId == DisplayObjectId && Opcode == WlDisplayErrorEvent) {
     handleDisplayError(Msg);
+  } else {
+    // TODO: add more event handlers
   }
-  // TODO: add more event handlers
 }
 
 void Display::handleRegistryGlobal(Utils::Buffer &Msg,
@@ -353,13 +623,12 @@ void Display::handleRegistryGlobal(Utils::Buffer &Msg,
 
   // bind interfaces we need
   if (Interface == "wl_shm") {
-    WlShm = sendRegistryBind(Name, Interface, Interface.size() + 1, Version);
+    WlShm = wlRegistryBind(Name, Interface, Interface.size() + 1, Version);
   } else if (Interface == "xdg_wm_base") {
-    XdgWmBase =
-        sendRegistryBind(Name, Interface, Interface.size() + 1, Version);
+    XdgWmBase = wlRegistryBind(Name, Interface, Interface.size() + 1, Version);
   } else if (Interface == "wl_compositor") {
     WlCompositor =
-        sendRegistryBind(Name, Interface, Interface.size() + 1, Version);
+        wlRegistryBind(Name, Interface, Interface.size() + 1, Version);
   }
 }
 
