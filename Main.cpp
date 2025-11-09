@@ -22,81 +22,12 @@
 #include <type_traits>
 #include <vector>
 
-static constexpr uint32_t WaylandDisplayObjectId = 1;
-static constexpr uint16_t WaylandWlRegistryEventGlobal = 0;
-static constexpr uint16_t WaylandShmPoolEventFormat = 0;
-static constexpr uint16_t WaylandWlBufferEventRelease = 0;
-static constexpr uint16_t WaylandXdgWmBaseEventPing = 0;
-static constexpr uint16_t WaylandXdgToplevelEventConfigure = 0;
-static constexpr uint16_t WaylandXdgToplevelEventClose = 1;
-static constexpr uint16_t WaylandXdgSurfaceEventConfigure = 0;
-static constexpr uint16_t WaylandWlDisplayGetRegistryOpcode = 1;
-static constexpr uint16_t WaylandWlRegistryBindOpcode = 0;
-static constexpr uint16_t WaylandWlCompositorCreateSurfaceOpcode = 0;
-static constexpr uint16_t WaylandXdgWmBasePongOpcode = 3;
-static constexpr uint16_t WaylandXdgSurfaceAckConfigureOpcode = 4;
-static constexpr uint16_t WaylandWlShmCreatePoolOpcode = 0;
-static constexpr uint16_t WaylandXdgWmBaseGetXdgSurfaceOpcode = 2;
-static constexpr uint16_t WaylandWlShmPoolCreateBufferOpcode = 0;
-static constexpr uint16_t WaylandWlSurfaceAttachOpcode = 1;
-static constexpr uint16_t WaylandXdgSurfaceGetToplevelOpcode = 1;
-static constexpr uint16_t WaylandWlSurfaceCommitOpcode = 6;
-static constexpr uint16_t WaylandWlDisplayErrorEvent = 0;
-static constexpr uint32_t WaylandFormatXrgb8888 = 1;
-static constexpr uint32_t WaylandHeaderSize = 8;
-static constexpr uint32_t ColorChannels = 4;
-
-class WaylandDisplay {
-public:
-  void connect();
-
-private:
-  int Fd = -1;
-  std::string XdgRuntimeDir;
-  std::string WaylandDisplayName;
-};
-
-void WaylandDisplay::connect() {
-  // get env vars
-  char *XdgRuntimeDirEnv = std::getenv("XDG_RUNTIME_DIR");
-  if (!XdgRuntimeDirEnv)
-    throw std::runtime_error("XDG_RUNTIME_DIR not set");
-  XdgRuntimeDir = std::string(XdgRuntimeDirEnv);
-
-  char *WaylandDisplayEnv = std::getenv("WAYLAND_DISPLAY");
-  WaylandDisplayName =
-      WaylandDisplayEnv ? std::string(WaylandDisplayEnv) : "wayland-0";
-
-  // prepare socket path
-  std::string SocketPath = XdgRuntimeDir + "/" + WaylandDisplayName;
-  if (SocketPath.size() >= sizeof(sockaddr_un::sun_path))
-    throw std::runtime_error("socket path too long");
-
-  // prepare Unix socket address
-  struct sockaddr_un Addr = {.sun_family = AF_UNIX};
-  SocketPath.copy(Addr.sun_path, SocketPath.size());
-  Addr.sun_path[SocketPath.size()] = '\0';
-
-  // create Unix socket
-  Fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (Fd == -1)
-    throw std::system_error(errno, std::generic_category(),
-                            "failed to create socket");
-
-  // connect to socket
-  struct sockaddr *SockAddr = reinterpret_cast<struct sockaddr *>(&Addr);
-  if (::connect(Fd, SockAddr, sizeof(SockAddr)) == -1) {
-    int SavedErrno = errno;
-    close(Fd);
-    Fd = -1;
-    throw std::system_error(SavedErrno, std::generic_category(),
-                            "failed to connect to wayland display");
-  }
-}
-
 namespace Utils {
 
-static constexpr size_t roundUp4(size_t N) { return (N + 3) & ~size_t(3); }
+static constexpr size_t roundUp4(size_t N) {
+  size_t Mask = ~size_t(3); // 0b...11111100
+  return (N + 3) & Mask;
+}
 
 class Buffer {
 public:
@@ -144,6 +75,7 @@ public:
     return Result;
   }
 
+  const char *data() const { return Data.data(); }
   size_t size() const { return Data.size(); }
   size_t position() const { return Position; }
 
@@ -151,12 +83,112 @@ private:
   std::vector<char> Data;
   size_t Position;
 };
-
 } // namespace Utils
+
+namespace Wayland {
+
+static constexpr uint32_t DisplayObjectId = 1;
+static constexpr uint16_t WlRegistryEventGlobal = 0;
+static constexpr uint16_t ShmPoolEventFormat = 0;
+static constexpr uint16_t WlBufferEventRelease = 0;
+static constexpr uint16_t XdgWmBaseEventPing = 0;
+static constexpr uint16_t XdgToplevelEventConfigure = 0;
+static constexpr uint16_t XdgToplevelEventClose = 1;
+static constexpr uint16_t XdgSurfaceEventConfigure = 0;
+static constexpr uint16_t WlDisplayGetRegistryOpcode = 1;
+static constexpr uint16_t WlRegistryBindOpcode = 0;
+static constexpr uint16_t WlCompositorCreateSurfaceOpcode = 0;
+static constexpr uint16_t XdgWmBasePongOpcode = 3;
+static constexpr uint16_t XdgSurfaceAckConfigureOpcode = 4;
+static constexpr uint16_t WlShmCreatePoolOpcode = 0;
+static constexpr uint16_t XdgWmBaseGetXdgSurfaceOpcode = 2;
+static constexpr uint16_t WlShmPoolCreateBufferOpcode = 0;
+static constexpr uint16_t WlSurfaceAttachOpcode = 1;
+static constexpr uint16_t XdgSurfaceGetToplevelOpcode = 1;
+static constexpr uint16_t WlSurfaceCommitOpcode = 6;
+static constexpr uint16_t WlDisplayErrorEvent = 0;
+static constexpr uint32_t FormatXrgb8888 = 1;
+static constexpr uint32_t HeaderSize = 8;
+static constexpr uint32_t ColorChannels = 4;
+
+class Display {
+public:
+  void connect();
+  void getRegistry();
+
+  int getFd() const { return Fd; }
+  uint32_t getCurrentId() const { return CurrentId; }
+
+private:
+  int Fd = -1;
+  uint32_t CurrentId = 1;
+  std::string XdgRuntimeDir;
+  std::string DisplayName;
+};
+
+void Display::connect() {
+  // get env vars
+  char *XdgRuntimeDirEnv = std::getenv("XDG_RUNTIME_DIR");
+  if (!XdgRuntimeDirEnv)
+    throw std::runtime_error("XDG_RUNTIME_DIR not set");
+  XdgRuntimeDir = std::string(XdgRuntimeDirEnv);
+
+  char *WaylandDisplayEnv = std::getenv("WAYLAND_DISPLAY");
+  DisplayName =
+      WaylandDisplayEnv ? std::string(WaylandDisplayEnv) : "wayland-0";
+
+  // prepare socket path
+  std::string SocketPath = XdgRuntimeDir + "/" + DisplayName;
+  if (SocketPath.size() >= sizeof(sockaddr_un::sun_path))
+    throw std::runtime_error("socket path too long");
+
+  // prepare Unix socket address
+  struct sockaddr_un Addr = {.sun_family = AF_UNIX};
+  SocketPath.copy(Addr.sun_path, SocketPath.size());
+  Addr.sun_path[SocketPath.size()] = '\0';
+
+  // create Unix socket
+  Fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (Fd == -1)
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to create socket");
+
+  // connect to socket
+  struct sockaddr *SockAddr = reinterpret_cast<struct sockaddr *>(&Addr);
+  if (::connect(Fd, SockAddr, sizeof(SockAddr)) == -1) {
+    int SavedErrno = errno;
+    close(Fd);
+    Fd = -1;
+    throw std::system_error(SavedErrno, std::generic_category(),
+                            "failed to connect to wayland display");
+  }
+}
+
+void Display::getRegistry() {
+  Utils::Buffer Msg;
+  Msg.write(DisplayObjectId);
+  Msg.write(WlDisplayGetRegistryOpcode);
+
+  // message size (part of header)
+  uint16_t MsgAnnouncedSize = HeaderSize + sizeof(CurrentId);
+  assert(Utils::roundUp4(MsgAnnouncedSize) == MsgAnnouncedSize);
+  Msg.write(MsgAnnouncedSize);
+
+  // argument to get_registry
+  CurrentId++;
+  Msg.write(CurrentId);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), MSG_DONTWAIT);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send get_registry message");
+}
+} // namespace Wayland
 
 int main() {
   try {
-    WaylandDisplay Display;
+    Wayland::Display Display;
   } catch (const std::exception &Exception) {
     return EXIT_FAILURE;
   }
