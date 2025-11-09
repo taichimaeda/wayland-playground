@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200112L
+
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -13,9 +14,13 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <type_traits>
+#include <vector>
 
 static constexpr uint32_t WaylandDisplayObjectId = 1;
 static constexpr uint16_t WaylandWlRegistryEventGlobal = 0;
@@ -88,6 +93,66 @@ void WaylandDisplay::connect() {
                             "failed to connect to wayland display");
   }
 }
+
+namespace Utils {
+
+static constexpr size_t roundUp4(size_t N) { return (N + 3) & ~size_t(3); }
+
+class Buffer {
+public:
+  explicit Buffer() : Data{}, Position{0} {}
+  explicit Buffer(const std::vector<char> &Data) : Data{Data}, Position{0} {}
+
+  template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+  void write(T Value) {
+    assert(Position % alignof(T) == 0);
+
+    size_t OldSize = Data.size();
+    Data.resize(OldSize + sizeof(T));
+    std::memcpy(Data.data() + OldSize, &Value, sizeof(T));
+    Position += sizeof(T);
+  }
+
+  template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+  T read() {
+    assert(Position + sizeof(T) <= Data.size());
+    assert(Position % alignof(T) == 0);
+
+    T Value;
+    std::memcpy(&Value, Data.data() + Position, sizeof(T));
+    Position += sizeof(T);
+    return Value;
+  }
+
+  void writeString(std::string_view Str) {
+    // write length first for Wayland protocol
+    write(static_cast<uint32_t>(Str.size()));
+
+    size_t PaddedLen = roundUp4(Str.size());
+    size_t OldSize = Data.size();
+    Data.resize(OldSize + PaddedLen, '\0');
+    std::memcpy(Data.data() + Position, Str.data(), Str.size());
+    Position += PaddedLen;
+  }
+
+  std::string readString() {
+    uint32_t Len = read<uint32_t>();
+    assert(Position + Len <= Data.size());
+
+    std::string Result{Data.data() + Position, Len};
+    Position += roundUp4(Len);
+    return Result;
+  }
+
+  size_t size() const { return Data.size(); }
+  size_t position() const { return Position; }
+
+private:
+  std::vector<char> Data;
+  size_t Position;
+};
+
+} // namespace Utils
 
 int main() {
   try {
