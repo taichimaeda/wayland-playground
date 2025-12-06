@@ -127,7 +127,7 @@ public:
     uint32_t PaddedLen = Utils::roundUp4(Len);
     assert(Pos + PaddedLen <= Size);
 
-    std::string Result{Data + Pos, Len};
+    std::string Result{Data + Pos, Len - 1}; // exclude null terminator
     Pos += PaddedLen;
     return Result;
   }
@@ -155,13 +155,12 @@ public:
   }
 
   void writeString(std::string_view Str) {
-    // write length first as per Wayland protocol
-    writeUint(static_cast<uint32_t>(Str.size()));
+    uint32_t Len = Str.size() + 1; // include null terminator
+    writeUint(Len);
 
-    size_t Len = Str.size();
     size_t PaddedLen = Utils::roundUp4(Len);
-    Data.resize(Data.size() + PaddedLen, '\0');
-    std::memcpy(Data.data() + Pos, Str.data(), Len);
+    Data.resize(Data.size() + PaddedLen, '\0'); // zeros include null + padding
+    std::memcpy(Data.data() + Pos, Str.data(), Str.size());
     Pos += PaddedLen;
   }
 
@@ -443,7 +442,7 @@ uint32_t Display::wlGetRegistry() {
   Msg.writeUint(CurrentObjectId);
 
   // send message
-  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), MSG_DONTWAIT);
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
   if (static_cast<size_t>(Sent) != Msg.size())
     throw std::system_error(errno, std::generic_category(),
                             "failed to send get_registry message");
@@ -459,9 +458,10 @@ uint32_t Display::wlRegistryBind(uint32_t Name, std::string_view Interface,
   Msg.writeUint(State.WlRegistry);
   Msg.writeUint(Opcode::WlRegistryBind);
 
-  // calculate message size
-  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(Name) +
-                              Utils::roundUp4(Interface.size()) +
+  // calculate message size (+1 for null terminator, +4 for string length
+  // prefix)
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(Name) + sizeof(uint32_t) +
+                              Utils::roundUp4(Interface.size() + 1) +
                               sizeof(Version) + sizeof(CurrentObjectId);
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
   Msg.writeUint(MsgSizeAnnounced);
