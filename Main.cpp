@@ -132,11 +132,11 @@ public:
     uint32_t WlShm{};
     uint32_t WlShmPool{};
     uint32_t WlBuffer{};
-    uint32_t XdgWmBase{};
-    uint32_t XdgSurface{};
     uint32_t WlCompositor{};
     uint32_t WlSurface{};
     uint32_t XdgToplevel{};
+    uint32_t XdgWmBase{};
+    uint32_t XdgSurface{};
   };
 
   struct SharedMemory {
@@ -161,13 +161,13 @@ public:
                           uint32_t InterfaceLen, uint32_t Version);
   uint32_t wlCompositorCreateSurface();
   uint32_t wlShmCreatePool();
-  uint32_t wlXdgWmBaseGetXdgSurface();
   uint32_t wlShmPoolCreateBuffer();
   void wlSurfaceAttach();
   void wlSurfaceCommit();
-  uint32_t wlXdgSurfaceGetToplevel();
-  void wlXdgWmBasePong(uint32_t Ping);
-  void wlXdgSurfaceAckConfigure(uint32_t Configure);
+  uint32_t xdgWmBaseGetXdgSurface();
+  uint32_t xdgSurfaceGetToplevel();
+  void xdgWmBasePong(uint32_t Ping);
+  void xdgSurfaceAckConfigure(uint32_t Configure);
 
   void handleMessage(Utils::Buffer &Msg);
 
@@ -176,19 +176,19 @@ private:
   void handleDisplayError(Utils::Buffer &Msg);
 
   int Fd = -1;
-  uint32_t CurrentId = 1;
-  std::string XdgRuntimeDir;
+  std::string RuntimeDir;
   std::string DisplayName;
 
   State State;
   Status Status{Status::None};
   SharedMemory SharedMemory;
+  uint32_t CurrentObjectId = 1;
 };
 
 void Display::initialize() {
   // set shared memory parameters
-  SharedMemory.Width = 800;
-  SharedMemory.Height = 600;
+  SharedMemory.Width = 117;
+  SharedMemory.Height = 150;
   SharedMemory.Stride = SharedMemory.Width * ColorChannels;
   size_t PoolSize = SharedMemory.Stride * SharedMemory.Height;
 
@@ -201,14 +201,14 @@ void Display::connect() {
   char *XdgRuntimeDirEnv = std::getenv("XDG_RUNTIME_DIR");
   if (!XdgRuntimeDirEnv)
     throw std::runtime_error("XDG_RUNTIME_DIR not set");
-  XdgRuntimeDir = std::string(XdgRuntimeDirEnv);
+  RuntimeDir = std::string(XdgRuntimeDirEnv);
 
   char *WaylandDisplayEnv = std::getenv("WAYLAND_DISPLAY");
   DisplayName =
       WaylandDisplayEnv ? std::string(WaylandDisplayEnv) : "wayland-0";
 
   // prepare socket path
-  std::string SocketPath = XdgRuntimeDir + "/" + DisplayName;
+  std::string SocketPath = RuntimeDir + "/" + DisplayName;
   if (SocketPath.size() >= sizeof(sockaddr_un::sun_path))
     throw std::runtime_error("socket path too long");
 
@@ -266,19 +266,20 @@ void Display::SharedMemory::allocate(size_t Size) {
   PoolSize = Size;
 }
 
+// uint32_t wl_get_registry(uint32_t new_id)
 uint32_t Display::wlGetRegistry() {
   Utils::Buffer Msg;
   Msg.writeUint(DisplayObjectId);
   Msg.writeUint(Opcode::WlDisplayGetRegistry);
 
   // message size (part of header)
-  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentId);
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentObjectId);
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
   Msg.writeUint(MsgSizeAnnounced);
 
   // argument to get_registry
-  CurrentId++;
-  Msg.writeUint(CurrentId);
+  CurrentObjectId++;
+  Msg.writeUint(CurrentObjectId);
 
   // send message
   ssize_t Sent = send(Fd, Msg.data(), Msg.size(), MSG_DONTWAIT);
@@ -286,9 +287,11 @@ uint32_t Display::wlGetRegistry() {
     throw std::system_error(errno, std::generic_category(),
                             "failed to send get_registry message");
 
-  return CurrentId;
+  return CurrentObjectId;
 }
 
+// uint32_t wl_registry_bind(uint32_t name, const char *interface, uint32_t
+// version)
 uint32_t Display::wlRegistryBind(uint32_t Name, std::string_view Interface,
                                  uint32_t InterfaceLen, uint32_t Version) {
   Utils::Buffer Msg;
@@ -299,7 +302,7 @@ uint32_t Display::wlRegistryBind(uint32_t Name, std::string_view Interface,
   uint32_t PaddedInterfaceLen = Utils::roundUp4(InterfaceLen);
   uint16_t MsgSizeAnnounced = HeaderSize + sizeof(Name) + sizeof(InterfaceLen) +
                               PaddedInterfaceLen + sizeof(Version) +
-                              sizeof(CurrentId);
+                              sizeof(CurrentObjectId);
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
   Msg.writeUint(MsgSizeAnnounced);
 
@@ -309,8 +312,8 @@ uint32_t Display::wlRegistryBind(uint32_t Name, std::string_view Interface,
   Msg.writeUint(Version);
 
   // allocate new object id and write it
-  CurrentId++;
-  Msg.writeUint(CurrentId);
+  CurrentObjectId++;
+  Msg.writeUint(CurrentObjectId);
 
   // verify buffer size is aligned
   assert(Msg.size() == Utils::roundUp4(Msg.size()));
@@ -321,9 +324,10 @@ uint32_t Display::wlRegistryBind(uint32_t Name, std::string_view Interface,
     throw std::system_error(errno, std::generic_category(),
                             "failed to send registry bind message");
 
-  return CurrentId;
+  return CurrentObjectId;
 }
 
+// uint32_t wl_compositor_create_surface()
 uint32_t Display::wlCompositorCreateSurface() {
   assert(State.WlCompositor > 0);
 
@@ -332,13 +336,13 @@ uint32_t Display::wlCompositorCreateSurface() {
   Msg.writeUint(Opcode::WlCompositorCreateSurface);
 
   // calculate message size
-  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentId);
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentObjectId);
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
   Msg.writeUint(MsgSizeAnnounced);
 
   // allocate new object id and write it
-  CurrentId++;
-  Msg.writeUint(CurrentId);
+  CurrentObjectId++;
+  Msg.writeUint(CurrentObjectId);
 
   // send message
   ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
@@ -346,10 +350,11 @@ uint32_t Display::wlCompositorCreateSurface() {
     throw std::system_error(errno, std::generic_category(),
                             "failed to send compositor create_surface message");
 
-  return CurrentId;
+  return CurrentObjectId;
 }
 
 // TODO: revisit this method
+// uint32_t wl_shm_create_pool(int fd, uint32_t size)
 uint32_t Display::wlShmCreatePool() {
   assert(SharedMemory.PoolSize > 0);
 
@@ -359,13 +364,13 @@ uint32_t Display::wlShmCreatePool() {
 
   // calculate message size
   uint16_t MsgSizeAnnounced =
-      HeaderSize + sizeof(CurrentId) + sizeof(SharedMemory.PoolSize);
+      HeaderSize + sizeof(CurrentObjectId) + sizeof(SharedMemory.PoolSize);
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
   Msg.writeUint(MsgSizeAnnounced);
 
   // allocate new object id and write it
-  CurrentId++;
-  Msg.writeUint(CurrentId);
+  CurrentObjectId++;
+  Msg.writeUint(CurrentObjectId);
 
   // write pool size
   Msg.writeUint(SharedMemory.PoolSize);
@@ -398,40 +403,11 @@ uint32_t Display::wlShmCreatePool() {
     throw std::system_error(errno, std::generic_category(),
                             "failed to send wl_shm create_pool message");
 
-  return CurrentId;
+  return CurrentObjectId;
 }
 
-uint32_t Display::wlXdgWmBaseGetXdgSurface() {
-  assert(State.XdgWmBase > 0);
-  assert(State.WlSurface > 0);
-
-  Utils::Buffer Msg;
-  Msg.writeUint(State.XdgWmBase);
-  Msg.writeUint(Opcode::XdgWmBaseGetXdgSurface);
-
-  // calculate message size
-  uint16_t MsgSizeAnnounced =
-      HeaderSize + sizeof(CurrentId) + sizeof(State.WlSurface);
-  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
-  Msg.writeUint(MsgSizeAnnounced);
-
-  // allocate new object id and write it
-  CurrentId++;
-  Msg.writeUint(CurrentId);
-
-  // write wl_surface argument
-  Msg.writeUint(State.WlSurface);
-
-  // send message
-  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
-  if (static_cast<size_t>(Sent) != Msg.size())
-    throw std::system_error(
-        errno, std::generic_category(),
-        "failed to send xdg_wm_base get_xdg_surface message");
-
-  return CurrentId;
-}
-
+// uint32_t shm_pool_create_buffer(uint32_t offset, uint32_t width, uint32_t
+// height, uint32_t stride, uint32_t format)
 uint32_t Display::wlShmPoolCreateBuffer() {
   assert(State.WlShmPool > 0);
 
@@ -441,13 +417,13 @@ uint32_t Display::wlShmPoolCreateBuffer() {
 
   // calculate message size
   uint16_t MsgSizeAnnounced =
-      HeaderSize + sizeof(CurrentId) + sizeof(uint32_t) * 5;
+      HeaderSize + sizeof(CurrentObjectId) + sizeof(uint32_t) * 5;
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
   Msg.writeUint(MsgSizeAnnounced);
 
   // allocate new object id and write it
-  CurrentId++;
-  Msg.writeUint(CurrentId);
+  CurrentObjectId++;
+  Msg.writeUint(CurrentObjectId);
 
   // write buffer parameters
   uint32_t Offset = 0;
@@ -463,9 +439,10 @@ uint32_t Display::wlShmPoolCreateBuffer() {
     throw std::system_error(errno, std::generic_category(),
                             "failed to send wl_shm_pool create_buffer message");
 
-  return CurrentId;
+  return CurrentObjectId;
 }
 
+// void wl_surface_attach(wl_buffer *buffer, int32_t x, int32_t y)
 void Display::wlSurfaceAttach() {
   assert(State.WlSurface > 0);
   assert(State.WlBuffer > 0);
@@ -493,6 +470,7 @@ void Display::wlSurfaceAttach() {
                             "failed to send wl_surface attach message");
 }
 
+// void surface_commit()
 void Display::wlSurfaceCommit() {
   assert(State.WlSurface > 0);
 
@@ -512,7 +490,40 @@ void Display::wlSurfaceCommit() {
                             "failed to send wl_surface commit message");
 }
 
-uint32_t Display::wlXdgSurfaceGetToplevel() {
+// uint32_t xdg_wm_base_get_xdg_surface(uint32_t new_id)
+uint32_t Display::xdgWmBaseGetXdgSurface() {
+  assert(State.XdgWmBase > 0);
+  assert(State.WlSurface > 0);
+
+  Utils::Buffer Msg;
+  Msg.writeUint(State.XdgWmBase);
+  Msg.writeUint(Opcode::XdgWmBaseGetXdgSurface);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced =
+      HeaderSize + sizeof(CurrentObjectId) + sizeof(State.WlSurface);
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // allocate new object id and write it
+  CurrentObjectId++;
+  Msg.writeUint(CurrentObjectId);
+
+  // write wl_surface argument
+  Msg.writeUint(State.WlSurface);
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(
+        errno, std::generic_category(),
+        "failed to send xdg_wm_base get_xdg_surface message");
+
+  return CurrentObjectId;
+}
+
+// uint32_t xdg_surface_get_toplevel(uint32_t new_id)
+uint32_t Display::xdgSurfaceGetToplevel() {
   assert(State.XdgSurface > 0);
 
   Utils::Buffer Msg;
@@ -520,13 +531,13 @@ uint32_t Display::wlXdgSurfaceGetToplevel() {
   Msg.writeUint(Opcode::XdgSurfaceGetToplevel);
 
   // calculate message size
-  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentId);
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(CurrentObjectId);
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
   Msg.writeUint(MsgSizeAnnounced);
 
   // allocate new object id and write it
-  CurrentId++;
-  Msg.writeUint(CurrentId);
+  CurrentObjectId++;
+  Msg.writeUint(CurrentObjectId);
 
   // send message
   ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
@@ -534,10 +545,11 @@ uint32_t Display::wlXdgSurfaceGetToplevel() {
     throw std::system_error(errno, std::generic_category(),
                             "failed to send xdg_surface get_toplevel message");
 
-  return CurrentId;
+  return CurrentObjectId;
 }
 
-void Display::wlXdgWmBasePong(uint32_t Ping) {
+// void xdg_wm_base_pong(uint32_t ping)
+void Display::xdgWmBasePong(uint32_t Ping) {
   assert(State.XdgWmBase > 0);
   assert(State.WlSurface > 0);
 
@@ -560,7 +572,8 @@ void Display::wlXdgWmBasePong(uint32_t Ping) {
                             "failed to send xdg_wm_base pong message");
 }
 
-void Display::wlXdgSurfaceAckConfigure(uint32_t Configure) {
+// void xdg_surface_ack_configure(uint32_t configure)
+void Display::xdgSurfaceAckConfigure(uint32_t Configure) {
   assert(State.XdgSurface > 0);
 
   Utils::Buffer Msg;
@@ -587,7 +600,7 @@ void Display::handleMessage(Utils::Buffer &Msg) {
 
   // read header
   uint32_t ObjectId = Msg.readUint<uint32_t>();
-  assert(ObjectId <= CurrentId);
+  assert(ObjectId <= CurrentObjectId);
 
   uint16_t Opcode = Msg.readUint<uint16_t>();
   uint16_t MsgSizeAnnounced = Msg.readUint<uint16_t>();
