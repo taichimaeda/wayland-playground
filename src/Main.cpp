@@ -431,7 +431,7 @@ Display::Display() {
 
   // connect to socket
   struct sockaddr *SockAddr = reinterpret_cast<struct sockaddr *>(&Addr);
-  if (::connect(Fd, SockAddr, sizeof(Addr)) == -1) {
+  if (connect(Fd, SockAddr, sizeof(Addr)) == -1) {
     int SavedErrno = errno;
     close(Fd);
     Fd = -1;
