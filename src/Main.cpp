@@ -143,8 +143,6 @@ private:
 
 class MessageDraft {
 public:
-  MessageDraft() : Data{}, Pos{0} {}
-
   template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
   void writeUint(T Value) {
     assert(Pos % alignof(T) == 0);
@@ -171,8 +169,8 @@ public:
   size_t pos() const { return Pos; }
 
 private:
-  std::vector<char> Data;
-  size_t Pos;
+  std::vector<char> Data{};
+  size_t Pos{0};
 };
 
 class SharedMemory {
@@ -329,15 +327,14 @@ private:
   void handleRegistryGlobal(MessageView &Msg);
   void handleDisplayError(MessageView &Msg);
 
-  RingBuffer RecvBuffer;
-
   int Fd = -1;
-  std::string RuntimeDir;
-  std::string DisplayName;
+  std::string RuntimeDir{};
+  std::string DisplayName{};
 
-  State State;
+  State State{};
   Status Status{Status::None};
-  SharedMemory SharedMemory{117, 150, ColorChannels};
+  RingBuffer Buffer{};
+  SharedMemory Pixels{117, 150, ColorChannels};
   uint32_t CurrentObjectId = 1;
 };
 
@@ -389,11 +386,10 @@ Display::~Display() {
 
 void Display::run() {
   while (true) {
-    if (RecvBuffer.full())
+    if (Buffer.full())
       throw std::runtime_error("ring buffer full");
 
-    ssize_t RecvLen =
-        recv(Fd, RecvBuffer.writePtr(), RecvBuffer.writeAvailable(), 0);
+    ssize_t RecvLen = recv(Fd, Buffer.writePtr(), Buffer.writeAvailable(), 0);
     if (RecvLen == -1) {
       throw std::system_error(errno, std::generic_category(),
                               "failed to receive message");
@@ -402,17 +398,17 @@ void Display::run() {
       throw std::runtime_error("wayland display connection closed");
     }
 
-    RecvBuffer.advanceRead(RecvLen);
+    Buffer.advanceRead(RecvLen);
 
-    while (RecvBuffer.readAvailable() >= HeaderSize) {
+    while (Buffer.readAvailable() >= HeaderSize) {
       uint16_t MsgSize;
-      std::memcpy(&MsgSize, RecvBuffer.readPtr() + 6, sizeof(MsgSize));
+      std::memcpy(&MsgSize, Buffer.readPtr() + 6, sizeof(MsgSize));
 
-      if (RecvBuffer.readAvailable() < MsgSize)
+      if (Buffer.readAvailable() < MsgSize)
         break;
 
-      MessageView Msg(RecvBuffer.readPtr(), MsgSize);
-      RecvBuffer.advanceWrite(MsgSize);
+      MessageView Msg(Buffer.readPtr(), MsgSize);
+      Buffer.advanceWrite(MsgSize);
 
       handleMessage(Msg);
     }
@@ -507,7 +503,7 @@ uint32_t Display::wlCompositorCreateSurface() {
 
 // uint32_t wl_shm_create_pool(int fd, uint32_t size)
 uint32_t Display::wlShmCreatePool() {
-  assert(SharedMemory.poolSize() > 0);
+  assert(Pixels.poolSize() > 0);
 
   MessageDraft Msg;
   Msg.writeUint(State.WlShm);
@@ -524,12 +520,12 @@ uint32_t Display::wlShmCreatePool() {
   Msg.writeUint(CurrentObjectId);
 
   // write pool size
-  Msg.writeUint(SharedMemory.poolSize());
+  Msg.writeUint(Pixels.poolSize());
 
   assert(Msg.size() == Utils::roundUp4(Msg.size()));
 
   // send the file descriptor as ancillary data
-  int ShmFd = SharedMemory.fd();
+  int ShmFd = Pixels.fd();
   char Buf[CMSG_SPACE(sizeof(ShmFd))]{};
 
   struct iovec Io = {.iov_base = const_cast<char *>(Msg.data()),
@@ -580,9 +576,9 @@ uint32_t Display::wlShmPoolCreateBuffer() {
   // write buffer parameters
   uint32_t Offset = 0;
   Msg.writeUint(Offset);
-  Msg.writeUint(SharedMemory.width());
-  Msg.writeUint(SharedMemory.height());
-  Msg.writeUint(SharedMemory.stride());
+  Msg.writeUint(Pixels.width());
+  Msg.writeUint(Pixels.height());
+  Msg.writeUint(Pixels.stride());
   Msg.writeUint(Format::Xrgb8888);
 
   // send message
