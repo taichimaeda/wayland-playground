@@ -54,9 +54,9 @@ public:
     }
 
     // reserve virtual address space
-    void *Addr = mmap(nullptr, Capacity * 2, PROT_NONE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (Addr == MAP_FAILED) {
+    Data = static_cast<char *>(mmap(nullptr, Capacity * 2, PROT_NONE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (Data == MAP_FAILED) {
       close(Fd);
       throw std::system_error(errno, std::generic_category(),
                               "failed to reserve ring buffer address space");
@@ -73,8 +73,6 @@ public:
       throw std::system_error(errno, std::generic_category(),
                               "failed to map ring buffer");
     }
-
-    Data = static_cast<char *>(Addr);
   }
 
   ~RingBuffer() {
@@ -126,11 +124,11 @@ public:
 
   std::string readString() {
     uint32_t Len = readUint<uint32_t>();
-    assert(Pos + Len <= Size);
-    assert(Utils::roundUp4(Len) == Len); // TODO: this may be too strict
+    uint32_t PaddedLen = Utils::roundUp4(Len);
+    assert(Pos + PaddedLen <= Size);
 
     std::string Result{Data + Pos, Len};
-    Pos += Len;
+    Pos += PaddedLen;
     return Result;
   }
 
@@ -160,10 +158,10 @@ public:
     // write length first as per Wayland protocol
     writeUint(static_cast<uint32_t>(Str.size()));
 
-    size_t PaddedLen = Utils::roundUp4(Str.size());
-    size_t OldSize = Data.size();
-    Data.resize(OldSize + PaddedLen, '\0');
-    std::memcpy(Data.data() + Pos, Str.data(), Str.size());
+    size_t Len = Str.size();
+    size_t PaddedLen = Utils::roundUp4(Len);
+    Data.resize(Data.size() + PaddedLen, '\0');
+    std::memcpy(Data.data() + Pos, Str.data(), Len);
     Pos += PaddedLen;
   }
 
@@ -379,7 +377,7 @@ Display::Display() {
 
   // connect to socket
   struct sockaddr *SockAddr = reinterpret_cast<struct sockaddr *>(&Addr);
-  if (::connect(Fd, SockAddr, sizeof(SockAddr)) == -1) {
+  if (::connect(Fd, SockAddr, sizeof(Addr)) == -1) {
     int SavedErrno = errno;
     close(Fd);
     Fd = -1;
