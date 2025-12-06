@@ -89,12 +89,13 @@ public:
   RingBuffer &operator=(RingBuffer &&) = delete;
 
   char *writePtr() { return Data + (Head % Capacity); }
-  size_t writeAvailable() const { return Capacity - (Head - Tail); }
-  void advanceRead(size_t N) { Head += N; }
-
   const char *readPtr() const { return Data + (Tail % Capacity); }
-  size_t readAvailable() const { return Head - Tail; }
-  void advanceWrite(size_t N) { Tail += N; }
+
+  size_t sizeWritable() const { return Capacity - (Head - Tail); }
+  size_t sizeReadable() const { return Head - Tail; }
+
+  void advanceWrite(size_t N) { Head += N; }
+  void advanceRead(size_t N) { Tail += N; }
 
   size_t capacity() const { return Capacity; }
   bool full() const { return Head - Tail >= Capacity; }
@@ -102,8 +103,10 @@ public:
 private:
   char *Data{nullptr};
   size_t Capacity{0};
-  size_t Head{0};
-  size_t Tail{0};
+
+  // [......Tail======Head......]
+  size_t Head{0}; // next write position
+  size_t Tail{0}; // next read position
 };
 
 class MessageView {
@@ -243,7 +246,8 @@ SharedMemory::~SharedMemory() {
 
 static constexpr uint32_t HeaderSize =
     8; // object id (4) + opcode (2) + size (2)
-static constexpr uint32_t ColorChannels = 4; // rgba
+static constexpr uint32_t MsgSizeOffset = 6;
+static constexpr uint32_t ColorChannels = 4;
 
 static constexpr uint32_t DisplayObjectId = 1; // singleton display object
 
@@ -307,7 +311,7 @@ public:
 
   void run();
 
-  // Wayland protocol methods
+private:
   uint32_t wlGetRegistry();
   uint32_t wlRegistryBind(uint32_t Name, std::string_view Interface,
                           uint32_t Version);
@@ -322,10 +326,18 @@ public:
   void xdgSurfaceAckConfigure(uint32_t Configure);
 
   void handleMessage(MessageView &Msg);
-
-private:
   void handleRegistryGlobal(MessageView &Msg);
   void handleDisplayError(MessageView &Msg);
+  void handleShmFormat(MessageView &Msg);
+  void handleBufferRelease(MessageView &Msg);
+  void handleXdgWmBasePing(MessageView &Msg);
+  void handleXdgToplevelConfigure(MessageView &Msg);
+  void handleXdgToplevelClose(MessageView &Msg);
+  void handleXdgSurfaceConfigure(MessageView &Msg);
+  void handleStatusNone();
+  void handleStatusSurfaceAckedConfigure();
+
+  void renderFrame();
 
   int Fd = -1;
   std::string RuntimeDir{};
@@ -389,29 +401,31 @@ void Display::run() {
     if (Buffer.full())
       throw std::runtime_error("ring buffer full");
 
-    ssize_t RecvLen = recv(Fd, Buffer.writePtr(), Buffer.writeAvailable(), 0);
-    if (RecvLen == -1) {
+    ssize_t RecvLen = recv(Fd, Buffer.writePtr(), Buffer.sizeWritable(), 0);
+    if (RecvLen == -1)
       throw std::system_error(errno, std::generic_category(),
                               "failed to receive message");
-    }
-    if (RecvLen == 0) {
+    if (RecvLen == 0)
       throw std::runtime_error("wayland display connection closed");
-    }
 
-    Buffer.advanceRead(RecvLen);
-
-    while (Buffer.readAvailable() >= HeaderSize) {
-      uint16_t MsgSize;
-      std::memcpy(&MsgSize, Buffer.readPtr() + 6, sizeof(MsgSize));
-
-      if (Buffer.readAvailable() < MsgSize)
+    Buffer.advanceWrite(RecvLen);
+    while (Buffer.sizeReadable() >= HeaderSize) {
+      uint16_t MsgSizeAnnounced;
+      std::memcpy(&MsgSizeAnnounced, Buffer.readPtr() + MsgSizeOffset,
+                  sizeof(MsgSizeAnnounced));
+      if (Buffer.sizeReadable() < MsgSizeAnnounced)
         break;
 
-      MessageView Msg(Buffer.readPtr(), MsgSize);
-      Buffer.advanceWrite(MsgSize);
+      MessageView Msg(Buffer.readPtr(), MsgSizeAnnounced);
+      Buffer.advanceRead(MsgSizeAnnounced);
 
       handleMessage(Msg);
     }
+
+    if (Status == Status::None)
+      handleStatusNone();
+    if (Status == Status::SurfaceAckedConfigure)
+      handleStatusSurfaceAckedConfigure();
   }
 }
 
@@ -760,8 +774,24 @@ void Display::handleMessage(MessageView &Msg) {
     handleRegistryGlobal(Msg);
   } else if (ObjectId == DisplayObjectId && Opcode == Event::WlDisplayError) {
     handleDisplayError(Msg);
+  } else if (ObjectId == State.WlShm && Opcode == Event::ShmPoolFormat) {
+    handleShmFormat(Msg);
+  } else if (ObjectId == State.WlBuffer && Opcode == Event::WlBufferRelease) {
+    handleBufferRelease(Msg);
+  } else if (ObjectId == State.XdgWmBase && Opcode == Event::XdgWmBasePing) {
+    handleXdgWmBasePing(Msg);
+  } else if (ObjectId == State.XdgToplevel &&
+             Opcode == Event::XdgToplevelConfigure) {
+    handleXdgToplevelConfigure(Msg);
+  } else if (ObjectId == State.XdgToplevel &&
+             Opcode == Event::XdgToplevelClose) {
+    handleXdgToplevelClose(Msg);
+  } else if (ObjectId == State.XdgSurface &&
+             Opcode == Event::XdgSurfaceConfigure) {
+    handleXdgSurfaceConfigure(Msg);
   } else {
-    // TODO: add more event handlers
+    std::cerr << "unhandled event: object_id=" << ObjectId
+              << " opcode=" << Opcode << std::endl;
   }
 }
 
@@ -790,6 +820,100 @@ void Display::handleDisplayError(MessageView &Msg) {
          << " code=" << Code << " error=" << Error;
   throw std::runtime_error(Stream.str());
 }
+
+void Display::handleShmFormat(MessageView &Msg) {
+  uint32_t Format = Msg.readUint<uint32_t>();
+  std::cout << "<- wl_shm: format=" << std::hex << Format << std::dec
+            << std::endl;
+}
+
+void Display::handleBufferRelease(MessageView &) {
+  // skip release for now
+  std::cout << "<- wl_buffer@" << State.WlBuffer << ".release" << std::endl;
+}
+
+void Display::handleXdgWmBasePing(MessageView &Msg) {
+  uint32_t Ping = Msg.readUint<uint32_t>();
+  std::cout << "<- xdg_wm_base@" << State.XdgWmBase << ".ping: ping=" << Ping
+            << std::endl;
+  xdgWmBasePong(Ping);
+}
+
+void Display::handleXdgToplevelConfigure(MessageView &Msg) {
+  uint32_t Width = Msg.readUint<uint32_t>();
+  uint32_t Height = Msg.readUint<uint32_t>();
+  uint32_t StatesLen = Msg.readUint<uint32_t>();
+  // skip states array
+  for (uint32_t I = 0; I < StatesLen / sizeof(uint32_t); ++I)
+    Msg.readUint<uint32_t>();
+
+  std::cout << "<- xdg_toplevel@" << State.XdgToplevel
+            << ".configure: w=" << Width << " h=" << Height << " states["
+            << StatesLen << "]" << std::endl;
+}
+
+void Display::handleXdgToplevelClose(MessageView &) {
+  std::cout << "<- xdg_toplevel@" << State.XdgToplevel << ".close" << std::endl;
+  std::exit(EXIT_SUCCESS);
+}
+
+void Display::handleXdgSurfaceConfigure(MessageView &Msg) {
+  uint32_t Configure = Msg.readUint<uint32_t>();
+  std::cout << "<- xdg_surface@" << State.XdgSurface
+            << ".configure: configure=" << Configure << std::endl;
+  xdgSurfaceAckConfigure(Configure);
+  Status = Status::SurfaceAckedConfigure;
+}
+
+void Display::handleStatusNone() {
+  assert(Status == Status::None);
+
+  if (State.WlCompositor == 0 || State.WlShm == 0 || State.XdgWmBase == 0)
+    return; // bind is not complete yet
+  if (State.WlSurface != 0)
+    return; // already created surface
+
+  State.WlSurface = wlCompositorCreateSurface();
+  State.XdgSurface = xdgWmBaseGetXdgSurface();
+  State.XdgToplevel = xdgSurfaceGetToplevel();
+  wlSurfaceCommit();
+}
+
+void Display::handleStatusSurfaceAckedConfigure() {
+  assert(Status == Status::SurfaceAckedConfigure);
+
+  assert(State.WlSurface != 0);
+  assert(State.XdgSurface != 0);
+  assert(State.XdgToplevel != 0);
+
+  if (State.WlShmPool == 0)
+    State.WlShmPool = wlShmCreatePool();
+  if (State.WlBuffer == 0)
+    State.WlBuffer = wlShmPoolCreateBuffer();
+
+  renderFrame();
+  wlSurfaceAttach();
+  wlSurfaceCommit();
+  Status = Status::SurfaceAttached;
+}
+
+void Display::renderFrame() {
+  assert(Pixels.poolData() != nullptr);
+  assert(Pixels.poolSize() != 0);
+
+  uint32_t *PixelData = reinterpret_cast<uint32_t *>(Pixels.poolData());
+  uint32_t Width = Pixels.width();
+  uint32_t Height = Pixels.height();
+
+  // fill with a solid color (blue) for now
+  for (uint32_t I = 0; I < Width * Height; ++I) {
+    uint8_t R = 0x00;
+    uint8_t G = 0x00;
+    uint8_t B = 0xFF;
+    PixelData[I] = (R << 16) | (G << 8) | B;
+  }
+}
+
 } // namespace Wayland
 
 int main() {
