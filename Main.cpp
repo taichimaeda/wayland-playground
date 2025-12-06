@@ -15,6 +15,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,10 +31,119 @@ static constexpr size_t roundUp4(size_t N) {
   return (N + 3) & Mask;
 }
 
-class Buffer {
+} // namespace Utils
+
+namespace Wayland {
+
+class RingBuffer {
 public:
-  explicit Buffer() : Data{}, Pos{0} {}
-  explicit Buffer(const std::vector<char> &Data) : Data{Data}, Pos{0} {}
+  RingBuffer() {
+    size_t PageSize = sysconf(_SC_PAGESIZE);
+    Capacity = PageSize; // must be multiple of page size
+
+    // allocate underlying memory
+    int Fd = memfd_create("ring-buffer", MFD_CLOEXEC);
+    if (Fd == -1)
+      throw std::system_error(errno, std::generic_category(),
+                              "failed to create ring buffer memfd");
+
+    if (ftruncate(Fd, Capacity) == -1) {
+      close(Fd);
+      throw std::system_error(errno, std::generic_category(),
+                              "failed to size ring buffer");
+    }
+
+    // reserve virtual address space
+    void *Addr = mmap(nullptr, Capacity * 2, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (Addr == MAP_FAILED) {
+      close(Fd);
+      throw std::system_error(errno, std::generic_category(),
+                              "failed to reserve ring buffer address space");
+    }
+
+    // create magic ring buffer mapping
+    void *First = mmap(Data, Capacity, PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_FIXED, Fd, 0);
+    void *Second = mmap(Data + Capacity, Capacity, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_FIXED, Fd, 0);
+    close(Fd); // can close fd after mapping
+    if (First == MAP_FAILED || Second == MAP_FAILED) {
+      munmap(Data, Capacity * 2);
+      throw std::system_error(errno, std::generic_category(),
+                              "failed to map ring buffer");
+    }
+
+    Data = static_cast<char *>(Addr);
+  }
+
+  ~RingBuffer() {
+    if (Data)
+      munmap(Data, Capacity * 2);
+  }
+
+  // prohibit copy/move
+  RingBuffer(const RingBuffer &) = delete;
+  RingBuffer &operator=(const RingBuffer &) = delete;
+  RingBuffer(RingBuffer &&) = delete;
+  RingBuffer &operator=(RingBuffer &&) = delete;
+
+  char *writePtr() { return Data + (Head % Capacity); }
+  size_t writeAvailable() const { return Capacity - (Head - Tail); }
+  void advanceRead(size_t N) { Head += N; }
+
+  const char *readPtr() const { return Data + (Tail % Capacity); }
+  size_t readAvailable() const { return Head - Tail; }
+  void advanceWrite(size_t N) { Tail += N; }
+
+  size_t capacity() const { return Capacity; }
+  bool full() const { return Head - Tail >= Capacity; }
+
+private:
+  char *Data{nullptr};
+  size_t Capacity{0};
+  size_t Head{0};
+  size_t Tail{0};
+};
+
+class MessageView {
+public:
+  MessageView(const char *Data, size_t Size) : Data{Data}, Size{Size}, Pos{0} {}
+
+  template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+  T readUint() {
+    assert(Pos + sizeof(T) <= Size);
+    assert(Pos % alignof(T) == 0);
+
+    T Value;
+    std::memcpy(&Value, Data + Pos, sizeof(T));
+    Pos += sizeof(T);
+    return Value;
+  }
+
+  std::string readString() {
+    uint32_t Len = readUint<uint32_t>();
+    assert(Pos + Len <= Size);
+    assert(Utils::roundUp4(Len) == Len); // TODO: this may be too strict
+
+    std::string Result{Data + Pos, Len};
+    Pos += Len;
+    return Result;
+  }
+
+  const char *data() const { return Data; }
+  size_t size() const { return Size; }
+  size_t pos() const { return Pos; }
+
+private:
+  const char *Data;
+  size_t Size;
+  size_t Pos;
+};
+
+class MessageDraft {
+public:
+  MessageDraft() : Data{}, Pos{0} {}
 
   template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
   void writeUint(T Value) {
@@ -44,34 +155,15 @@ public:
     Pos += sizeof(T);
   }
 
-  template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
-  T readUint() {
-    assert(Pos + sizeof(T) <= Data.size());
-    assert(Pos % alignof(T) == 0);
-
-    T Value;
-    std::memcpy(&Value, Data.data() + Pos, sizeof(T));
-    Pos += sizeof(T);
-    return Value;
-  }
-
   void writeString(std::string_view Str) {
     // write length first as per Wayland protocol
     writeUint(static_cast<uint32_t>(Str.size()));
 
-    size_t PaddedLen = roundUp4(Str.size());
+    size_t PaddedLen = Utils::roundUp4(Str.size());
     size_t OldSize = Data.size();
     Data.resize(OldSize + PaddedLen, '\0');
     std::memcpy(Data.data() + Pos, Str.data(), Str.size());
     Pos += PaddedLen;
-  }
-
-  std::string readString(uint32_t Len) {
-    assert(Pos + Len <= Data.size());
-
-    std::string Result{Data.data() + Pos, Len};
-    Pos += roundUp4(Len);
-    return Result;
   }
 
   const char *data() const { return Data.data(); }
@@ -83,23 +175,90 @@ private:
   size_t Pos;
 };
 
-} // namespace Utils
+class SharedMemory {
+public:
+  SharedMemory(uint32_t Width, uint32_t Height, uint32_t Channels);
+  ~SharedMemory();
 
-namespace Wayland {
+  SharedMemory(const SharedMemory &) = delete;
+  SharedMemory &operator=(const SharedMemory &) = delete;
+  SharedMemory(SharedMemory &&) = delete;
+  SharedMemory &operator=(SharedMemory &&) = delete;
+
+  int fd() const { return Fd; }
+  uint32_t stride() const { return Stride; }
+  uint32_t width() const { return Width; }
+  uint32_t height() const { return Height; }
+  uint32_t poolSize() const { return PoolSize; }
+  uint8_t *poolData() const { return PoolData; }
+
+private:
+  int Fd{-1};
+  uint32_t Stride{};
+  uint32_t Width{};
+  uint32_t Height{};
+  uint32_t PoolSize{};
+  uint8_t *PoolData{nullptr};
+};
+
+SharedMemory::SharedMemory(uint32_t Width, uint32_t Height, uint32_t Channels)
+    : Width{Width}, Height{Height} {
+  Stride = Width * Channels;
+  PoolSize = Stride * Height;
+
+  // create anonymous shared memory file in memory
+  Fd = memfd_create("wayland-shm", MFD_CLOEXEC);
+  if (Fd == -1)
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to create shared memory");
+
+  // set size
+  if (ftruncate(Fd, PoolSize) == -1) {
+    int SavedErrno = errno;
+    close(Fd);
+    Fd = -1;
+    throw std::system_error(SavedErrno, std::generic_category(),
+                            "failed to truncate shared memory");
+  }
+
+  // map memory
+  // PROT_READ | PROT_WRITE for read/write
+  // MAP_SHARED for sharing with compositor process
+  PoolData = static_cast<uint8_t *>(
+      mmap(nullptr, PoolSize, PROT_READ | PROT_WRITE, MAP_SHARED, Fd, 0));
+  if (PoolData == MAP_FAILED) {
+    int SavedErrno = errno;
+    close(Fd);
+    Fd = -1;
+    PoolData = nullptr;
+    throw std::system_error(SavedErrno, std::generic_category(),
+                            "failed to map shared memory");
+  }
+}
+
+SharedMemory::~SharedMemory() {
+  if (PoolData)
+    munmap(PoolData, PoolSize);
+  if (Fd != -1)
+    close(Fd);
+}
 
 static constexpr uint32_t HeaderSize =
     8; // object id (4) + opcode (2) + size (2)
 static constexpr uint32_t ColorChannels = 4; // rgba
 
 static constexpr uint32_t DisplayObjectId = 1; // singleton display object
-static constexpr uint16_t WlRegistryEventGlobal = 0;
-static constexpr uint16_t ShmPoolEventFormat = 0;
-static constexpr uint16_t WlBufferEventRelease = 0;
-static constexpr uint16_t XdgWmBaseEventPing = 0;
-static constexpr uint16_t XdgToplevelEventConfigure = 0;
-static constexpr uint16_t XdgToplevelEventClose = 1;
-static constexpr uint16_t XdgSurfaceEventConfigure = 0;
-static constexpr uint16_t WlDisplayErrorEvent = 0;
+
+namespace Event {
+static constexpr uint16_t WlRegistryGlobal = 0;
+static constexpr uint16_t ShmPoolFormat = 0;
+static constexpr uint16_t WlBufferRelease = 0;
+static constexpr uint16_t XdgWmBasePing = 0;
+static constexpr uint16_t XdgToplevelConfigure = 0;
+static constexpr uint16_t XdgToplevelClose = 1;
+static constexpr uint16_t XdgSurfaceConfigure = 0;
+static constexpr uint16_t WlDisplayError = 0;
+} // namespace Event
 
 namespace Opcode {
 static constexpr uint16_t WlDisplayGetRegistry = 1;
@@ -139,26 +298,21 @@ public:
     uint32_t XdgSurface{};
   };
 
-  struct SharedMemory {
-    int Fd{-1};
-    uint32_t Stride{};
-    uint32_t Width{};
-    uint32_t Height{};
-    uint32_t PoolSize{};
-    uint8_t *PoolData{nullptr};
+  Display();
+  ~Display();
 
-    void allocate(size_t Size);
-  };
+  // prohibit copy/move
+  Display(const Display &) = delete;
+  Display &operator=(const Display &) = delete;
+  Display(Display &&) = delete;
+  Display &operator=(Display &&) = delete;
 
-  // TODO: add constructor/destructor
-  // TODO: prohibit copy/move
-  void initialize();
-  void connect();
+  void run();
 
   // Wayland protocol methods
   uint32_t wlGetRegistry();
   uint32_t wlRegistryBind(uint32_t Name, std::string_view Interface,
-                          uint32_t InterfaceLen, uint32_t Version);
+                          uint32_t Version);
   uint32_t wlCompositorCreateSurface();
   uint32_t wlShmCreatePool();
   uint32_t wlShmPoolCreateBuffer();
@@ -169,11 +323,13 @@ public:
   void xdgWmBasePong(uint32_t Ping);
   void xdgSurfaceAckConfigure(uint32_t Configure);
 
-  void handleMessage(Utils::Buffer &Msg);
+  void handleMessage(MessageView &Msg);
 
 private:
-  void handleRegistryGlobal(Utils::Buffer &Msg, uint16_t MsgSizeAnnounced);
-  void handleDisplayError(Utils::Buffer &Msg);
+  void handleRegistryGlobal(MessageView &Msg);
+  void handleDisplayError(MessageView &Msg);
+
+  RingBuffer RecvBuffer;
 
   int Fd = -1;
   std::string RuntimeDir;
@@ -181,22 +337,11 @@ private:
 
   State State;
   Status Status{Status::None};
-  SharedMemory SharedMemory;
+  SharedMemory SharedMemory{117, 150, ColorChannels};
   uint32_t CurrentObjectId = 1;
 };
 
-void Display::initialize() {
-  // set shared memory parameters
-  SharedMemory.Width = 117;
-  SharedMemory.Height = 150;
-  SharedMemory.Stride = SharedMemory.Width * ColorChannels;
-  size_t PoolSize = SharedMemory.Stride * SharedMemory.Height;
-
-  // allocate shared memory
-  SharedMemory.allocate(PoolSize);
-}
-
-void Display::connect() {
+Display::Display() {
   // get env vars
   char *XdgRuntimeDirEnv = std::getenv("XDG_RUNTIME_DIR");
   if (!XdgRuntimeDirEnv)
@@ -232,43 +377,51 @@ void Display::connect() {
     throw std::system_error(SavedErrno, std::generic_category(),
                             "failed to connect to wayland display");
   }
+
+  // get wayland registry
+  State.WlRegistry = wlGetRegistry();
 }
 
-void Display::SharedMemory::allocate(size_t Size) {
-  // create anonymous shared memory file in memory
-  Fd = memfd_create("wayland-shm", MFD_CLOEXEC);
-  if (Fd == -1)
-    throw std::system_error(errno, std::generic_category(),
-                            "failed to create shared memory");
-
-  // set size
-  if (ftruncate(Fd, Size) == -1) {
-    int SavedErrno = errno;
+Display::~Display() {
+  if (Fd != -1)
     close(Fd);
-    Fd = -1;
-    throw std::system_error(SavedErrno, std::generic_category(),
-                            "failed to truncate shared memory");
-  }
+}
 
-  // map memory
-  // PROT_READ | PROT_WRITE for read/write
-  // MAP_SHARED for sharing with compositor process
-  PoolData = static_cast<uint8_t *>(
-      mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_SHARED, Fd, 0));
-  if (PoolData == MAP_FAILED) {
-    int SavedErrno = errno;
-    close(Fd);
-    Fd = -1;
-    PoolData = nullptr;
-    throw std::system_error(SavedErrno, std::generic_category(),
-                            "failed to map shared memory");
+void Display::run() {
+  while (true) {
+    if (RecvBuffer.full())
+      throw std::runtime_error("ring buffer full");
+
+    ssize_t RecvLen =
+        recv(Fd, RecvBuffer.writePtr(), RecvBuffer.writeAvailable(), 0);
+    if (RecvLen == -1) {
+      throw std::system_error(errno, std::generic_category(),
+                              "failed to receive message");
+    }
+    if (RecvLen == 0) {
+      throw std::runtime_error("wayland display connection closed");
+    }
+
+    RecvBuffer.advanceRead(RecvLen);
+
+    while (RecvBuffer.readAvailable() >= HeaderSize) {
+      uint16_t MsgSize;
+      std::memcpy(&MsgSize, RecvBuffer.readPtr() + 6, sizeof(MsgSize));
+
+      if (RecvBuffer.readAvailable() < MsgSize)
+        break;
+
+      MessageView Msg(RecvBuffer.readPtr(), MsgSize);
+      RecvBuffer.advanceWrite(MsgSize);
+
+      handleMessage(Msg);
+    }
   }
-  PoolSize = Size;
 }
 
 // uint32_t wl_get_registry(uint32_t new_id)
 uint32_t Display::wlGetRegistry() {
-  Utils::Buffer Msg;
+  MessageDraft Msg;
   Msg.writeUint(DisplayObjectId);
   Msg.writeUint(Opcode::WlDisplayGetRegistry);
 
@@ -293,16 +446,15 @@ uint32_t Display::wlGetRegistry() {
 // uint32_t wl_registry_bind(uint32_t name, const char *interface, uint32_t
 // version)
 uint32_t Display::wlRegistryBind(uint32_t Name, std::string_view Interface,
-                                 uint32_t InterfaceLen, uint32_t Version) {
-  Utils::Buffer Msg;
+                                 uint32_t Version) {
+  MessageDraft Msg;
   Msg.writeUint(State.WlRegistry);
   Msg.writeUint(Opcode::WlRegistryBind);
 
   // calculate message size
-  uint32_t PaddedInterfaceLen = Utils::roundUp4(InterfaceLen);
-  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(Name) + sizeof(InterfaceLen) +
-                              PaddedInterfaceLen + sizeof(Version) +
-                              sizeof(CurrentObjectId);
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(Name) +
+                              Utils::roundUp4(Interface.size()) +
+                              sizeof(Version) + sizeof(CurrentObjectId);
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
   Msg.writeUint(MsgSizeAnnounced);
 
@@ -331,7 +483,7 @@ uint32_t Display::wlRegistryBind(uint32_t Name, std::string_view Interface,
 uint32_t Display::wlCompositorCreateSurface() {
   assert(State.WlCompositor > 0);
 
-  Utils::Buffer Msg;
+  MessageDraft Msg;
   Msg.writeUint(State.WlCompositor);
   Msg.writeUint(Opcode::WlCompositorCreateSurface);
 
@@ -353,18 +505,17 @@ uint32_t Display::wlCompositorCreateSurface() {
   return CurrentObjectId;
 }
 
-// TODO: revisit this method
 // uint32_t wl_shm_create_pool(int fd, uint32_t size)
 uint32_t Display::wlShmCreatePool() {
-  assert(SharedMemory.PoolSize > 0);
+  assert(SharedMemory.poolSize() > 0);
 
-  Utils::Buffer Msg;
+  MessageDraft Msg;
   Msg.writeUint(State.WlShm);
   Msg.writeUint(Opcode::WlShmCreatePool);
 
   // calculate message size
   uint16_t MsgSizeAnnounced =
-      HeaderSize + sizeof(CurrentObjectId) + sizeof(SharedMemory.PoolSize);
+      HeaderSize + sizeof(CurrentObjectId) + sizeof(uint32_t);
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
   Msg.writeUint(MsgSizeAnnounced);
 
@@ -373,12 +524,13 @@ uint32_t Display::wlShmCreatePool() {
   Msg.writeUint(CurrentObjectId);
 
   // write pool size
-  Msg.writeUint(SharedMemory.PoolSize);
+  Msg.writeUint(SharedMemory.poolSize());
 
   assert(Msg.size() == Utils::roundUp4(Msg.size()));
 
   // send the file descriptor as ancillary data
-  char Buf[CMSG_SPACE(sizeof(SharedMemory.Fd))]{};
+  int ShmFd = SharedMemory.fd();
+  char Buf[CMSG_SPACE(sizeof(ShmFd))]{};
 
   struct iovec Io = {.iov_base = const_cast<char *>(Msg.data()),
                      .iov_len = Msg.size()};
@@ -394,10 +546,10 @@ uint32_t Display::wlShmCreatePool() {
   struct cmsghdr *Cmsg = CMSG_FIRSTHDR(&SocketMsg);
   Cmsg->cmsg_level = SOL_SOCKET;
   Cmsg->cmsg_type = SCM_RIGHTS;
-  Cmsg->cmsg_len = CMSG_LEN(sizeof(SharedMemory.Fd));
+  Cmsg->cmsg_len = CMSG_LEN(sizeof(ShmFd));
 
-  *reinterpret_cast<int *>(CMSG_DATA(Cmsg)) = SharedMemory.Fd;
-  SocketMsg.msg_controllen = CMSG_SPACE(sizeof(SharedMemory.Fd));
+  *reinterpret_cast<int *>(CMSG_DATA(Cmsg)) = ShmFd;
+  SocketMsg.msg_controllen = CMSG_SPACE(sizeof(ShmFd));
 
   if (sendmsg(Fd, &SocketMsg, 0) == -1)
     throw std::system_error(errno, std::generic_category(),
@@ -411,7 +563,7 @@ uint32_t Display::wlShmCreatePool() {
 uint32_t Display::wlShmPoolCreateBuffer() {
   assert(State.WlShmPool > 0);
 
-  Utils::Buffer Msg;
+  MessageDraft Msg;
   Msg.writeUint(State.WlShmPool);
   Msg.writeUint(Opcode::WlShmPoolCreateBuffer);
 
@@ -428,9 +580,9 @@ uint32_t Display::wlShmPoolCreateBuffer() {
   // write buffer parameters
   uint32_t Offset = 0;
   Msg.writeUint(Offset);
-  Msg.writeUint(SharedMemory.Width);
-  Msg.writeUint(SharedMemory.Height);
-  Msg.writeUint(SharedMemory.Stride);
+  Msg.writeUint(SharedMemory.width());
+  Msg.writeUint(SharedMemory.height());
+  Msg.writeUint(SharedMemory.stride());
   Msg.writeUint(Format::Xrgb8888);
 
   // send message
@@ -447,7 +599,7 @@ void Display::wlSurfaceAttach() {
   assert(State.WlSurface > 0);
   assert(State.WlBuffer > 0);
 
-  Utils::Buffer Msg;
+  MessageDraft Msg;
   Msg.writeUint(State.WlSurface);
   Msg.writeUint(Opcode::WlSurfaceAttach);
 
@@ -474,7 +626,7 @@ void Display::wlSurfaceAttach() {
 void Display::wlSurfaceCommit() {
   assert(State.WlSurface > 0);
 
-  Utils::Buffer Msg;
+  MessageDraft Msg;
   Msg.writeUint(State.WlSurface);
   Msg.writeUint(Opcode::WlSurfaceCommit);
 
@@ -495,7 +647,7 @@ uint32_t Display::xdgWmBaseGetXdgSurface() {
   assert(State.XdgWmBase > 0);
   assert(State.WlSurface > 0);
 
-  Utils::Buffer Msg;
+  MessageDraft Msg;
   Msg.writeUint(State.XdgWmBase);
   Msg.writeUint(Opcode::XdgWmBaseGetXdgSurface);
 
@@ -526,7 +678,7 @@ uint32_t Display::xdgWmBaseGetXdgSurface() {
 uint32_t Display::xdgSurfaceGetToplevel() {
   assert(State.XdgSurface > 0);
 
-  Utils::Buffer Msg;
+  MessageDraft Msg;
   Msg.writeUint(State.XdgSurface);
   Msg.writeUint(Opcode::XdgSurfaceGetToplevel);
 
@@ -553,7 +705,7 @@ void Display::xdgWmBasePong(uint32_t Ping) {
   assert(State.XdgWmBase > 0);
   assert(State.WlSurface > 0);
 
-  Utils::Buffer Msg;
+  MessageDraft Msg;
   Msg.writeUint(State.XdgWmBase);
   Msg.writeUint(Opcode::XdgWmBasePong);
 
@@ -576,7 +728,7 @@ void Display::xdgWmBasePong(uint32_t Ping) {
 void Display::xdgSurfaceAckConfigure(uint32_t Configure) {
   assert(State.XdgSurface > 0);
 
-  Utils::Buffer Msg;
+  MessageDraft Msg;
   Msg.writeUint(State.XdgSurface);
   Msg.writeUint(Opcode::XdgSurfaceAckConfigure);
 
@@ -595,7 +747,7 @@ void Display::xdgSurfaceAckConfigure(uint32_t Configure) {
                             "failed to send xdg_surface ack_configure message");
 }
 
-void Display::handleMessage(Utils::Buffer &Msg) {
+void Display::handleMessage(MessageView &Msg) {
   assert(Msg.size() >= 8);
 
   // read header
@@ -605,64 +757,51 @@ void Display::handleMessage(Utils::Buffer &Msg) {
   uint16_t Opcode = Msg.readUint<uint16_t>();
   uint16_t MsgSizeAnnounced = Msg.readUint<uint16_t>();
   assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
-
-  // verify message size
-  uint32_t HeaderSize =
-      sizeof(ObjectId) + sizeof(Opcode) + sizeof(MsgSizeAnnounced);
-  uint32_t MsgSize = HeaderSize + (Msg.size() - Msg.pos());
-  assert(MsgSizeAnnounced <= MsgSize);
+  assert(MsgSizeAnnounced <= Msg.size());
 
   // dispatch based on object and opcode
-  if (ObjectId == State.WlRegistry && Opcode == WlRegistryEventGlobal) {
-    handleRegistryGlobal(Msg, MsgSizeAnnounced);
-  } else if (ObjectId == DisplayObjectId && Opcode == WlDisplayErrorEvent) {
+  if (ObjectId == State.WlRegistry && Opcode == Event::WlRegistryGlobal) {
+    handleRegistryGlobal(Msg);
+  } else if (ObjectId == DisplayObjectId && Opcode == Event::WlDisplayError) {
     handleDisplayError(Msg);
   } else {
     // TODO: add more event handlers
   }
 }
 
-void Display::handleRegistryGlobal(Utils::Buffer &Msg,
-                                   uint16_t MsgSizeAnnounced) {
+void Display::handleRegistryGlobal(MessageView &Msg) {
   uint32_t Name = Msg.readUint<uint32_t>();
-  uint32_t InterfaceLen = Msg.readUint<uint32_t>();
-  std::string Interface = Msg.readString(InterfaceLen);
+  std::string Interface = Msg.readString();
   uint32_t Version = Msg.readUint<uint32_t>();
-
-  // verify message size
-  uint32_t PaddedInterfaceLen = Utils::roundUp4(Interface.size() + 1);
-  assert(MsgSizeAnnounced == HeaderSize + sizeof(Name) + sizeof(uint32_t) +
-                                 PaddedInterfaceLen + sizeof(Version));
 
   // bind interfaces we need
   if (Interface == "wl_shm") {
-    State.WlShm =
-        wlRegistryBind(Name, Interface, Interface.size() + 1, Version);
+    State.WlShm = wlRegistryBind(Name, Interface, Version);
   } else if (Interface == "xdg_wm_base") {
-    State.XdgWmBase =
-        wlRegistryBind(Name, Interface, Interface.size() + 1, Version);
+    State.XdgWmBase = wlRegistryBind(Name, Interface, Version);
   } else if (Interface == "wl_compositor") {
-    State.WlCompositor =
-        wlRegistryBind(Name, Interface, Interface.size() + 1, Version);
+    State.WlCompositor = wlRegistryBind(Name, Interface, Version);
   }
 }
 
-void Display::handleDisplayError(Utils::Buffer &Msg) {
+void Display::handleDisplayError(MessageView &Msg) {
   uint32_t TargetObjectId = Msg.readUint<uint32_t>();
   uint32_t Code = Msg.readUint<uint32_t>();
-  uint32_t ErrorLen = Msg.readUint<uint32_t>();
-  std::string Error = Msg.readString(ErrorLen);
+  std::string Error = Msg.readString();
 
-  throw std::runtime_error("fatal wayland error: target_object_id=" +
-                           std::to_string(TargetObjectId) +
-                           " code=" + std::to_string(Code) + " error=" + Error);
+  std::ostringstream Stream;
+  Stream << "fatal wayland error: target_object_id=" << TargetObjectId
+         << " code=" << Code << " error=" << Error;
+  throw std::runtime_error(Stream.str());
 }
 } // namespace Wayland
 
 int main() {
   try {
     Wayland::Display Display;
+    Display.run();
   } catch (const std::exception &Exception) {
+    std::cerr << "error: " << Exception.what() << std::endl;
     return EXIT_FAILURE;
   }
 
