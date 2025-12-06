@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -24,6 +26,9 @@
 #include <type_traits>
 #include <vector>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "../external/stb_image.h"
+
 namespace Utils {
 
 static constexpr size_t roundUp4(size_t N) {
@@ -32,6 +37,51 @@ static constexpr size_t roundUp4(size_t N) {
 }
 
 } // namespace Utils
+
+class Animation {
+public:
+  explicit Animation(const std::string &FrameDir, size_t FrameCount);
+
+  const std::vector<uint8_t> &frame(size_t Index) const {
+    assert(Index < Frames.size());
+    return Frames[Index];
+  }
+  size_t frameCount() const { return Frames.size(); }
+  size_t width() const { return Width; }
+  size_t height() const { return Height; }
+  size_t channels() const { return Channels; }
+
+private:
+  std::vector<std::vector<uint8_t>> Frames;
+  size_t Width{};
+  size_t Height{};
+  size_t Channels{};
+};
+
+Animation::Animation(const std::string &FrameDir, size_t FrameCount) {
+  Frames.reserve(FrameCount);
+
+  for (size_t I = 1; I <= FrameCount; ++I) {
+    std::ostringstream Path;
+    Path << FrameDir << "/frame_";
+    Path << std::setfill('0') << std::setw(4) << I;
+    Path << ".png";
+
+    int W, H, C;
+    uint8_t *Data = stbi_load(Path.str().c_str(), &W, &H, &C, 4);
+    if (!Data)
+      throw std::runtime_error("failed to load frame: " + Path.str());
+
+    Width = static_cast<size_t>(W);
+    Height = static_cast<size_t>(H);
+    Channels = static_cast<size_t>(C);
+
+    size_t DataSize = Width * Height * 4;
+    std::vector<uint8_t> Pixels(Data, Data + DataSize);
+    Frames.push_back(std::move(Pixels));
+    stbi_image_free(Data);
+  }
+}
 
 namespace Wayland {
 
@@ -175,7 +225,7 @@ private:
 
 class SharedMemory {
 public:
-  SharedMemory(uint32_t Width, uint32_t Height, uint32_t Channels);
+  SharedMemory(size_t Width, size_t Height, size_t Channels);
   ~SharedMemory();
 
   SharedMemory(const SharedMemory &) = delete;
@@ -199,8 +249,9 @@ private:
   uint8_t *PoolData{nullptr};
 };
 
-SharedMemory::SharedMemory(uint32_t Width, uint32_t Height, uint32_t Channels)
-    : Width{Width}, Height{Height} {
+SharedMemory::SharedMemory(size_t Width, size_t Height, size_t Channels)
+    : Width{static_cast<uint32_t>(Width)},
+      Height{static_cast<uint32_t>(Height)} {
   Stride = Width * Channels;
   PoolSize = Stride * Height;
 
@@ -241,13 +292,6 @@ SharedMemory::~SharedMemory() {
     close(Fd);
 }
 
-static constexpr uint32_t HeaderSize =
-    8; // object id (4) + opcode (2) + size (2)
-static constexpr uint32_t MsgSizeOffset = 6;
-static constexpr uint32_t ColorChannels = 4;
-
-static constexpr uint32_t DisplayObjectId = 1; // singleton display object
-
 namespace Event {
 static constexpr uint16_t WlRegistryGlobal = 0;
 static constexpr uint16_t ShmPoolFormat = 0;
@@ -269,6 +313,7 @@ static constexpr uint16_t WlShmCreatePool = 0;
 static constexpr uint16_t XdgWmBaseGetXdgSurface = 2;
 static constexpr uint16_t WlShmPoolCreateBuffer = 0;
 static constexpr uint16_t WlSurfaceAttach = 1;
+static constexpr uint16_t WlSurfaceDamage = 2;
 static constexpr uint16_t XdgSurfaceGetToplevel = 1;
 static constexpr uint16_t WlSurfaceCommit = 6;
 } // namespace Opcode
@@ -309,6 +354,11 @@ public:
   void run();
 
 private:
+  static constexpr uint32_t HeaderSize = 8;
+  static constexpr uint32_t MsgSizeOffset = 6;
+  static constexpr uint32_t DisplayObjectId = 1;
+  static constexpr int FrameDelayMs = 100; // ~10 fps
+
   uint32_t wlGetRegistry();
   uint32_t wlRegistryBind(uint32_t Name, std::string_view Interface,
                           uint32_t Version);
@@ -316,6 +366,7 @@ private:
   uint32_t wlShmCreatePool();
   uint32_t wlShmPoolCreateBuffer();
   void wlSurfaceAttach();
+  void wlSurfaceDamage();
   void wlSurfaceCommit();
   uint32_t xdgWmBaseGetXdgSurface();
   uint32_t xdgSurfaceGetToplevel();
@@ -333,7 +384,9 @@ private:
   void handleXdgSurfaceConfigure(MessageView &Msg);
   void handleStatusNone();
   void handleStatusSurfaceAckedConfigure();
+  void handleStatusSurfaceAttached();
 
+  bool pollEvents(int TimeoutMs);
   void renderFrame();
 
   int Fd = -1;
@@ -343,8 +396,10 @@ private:
   State State{};
   Status Status{Status::None};
   RingBuffer Buffer{};
-  SharedMemory Pixels{117, 150, ColorChannels};
+  Animation Anim{"src/frames", 311};
+  SharedMemory Pixels{Anim.width(), Anim.height(), Anim.channels()};
   uint32_t CurrentObjectId = 1;
+  size_t CurrentFrameIdx = 0;
 };
 
 Display::Display() {
@@ -395,8 +450,22 @@ Display::~Display() {
 
 void Display::run() {
   while (true) {
-    if (Buffer.full())
-      throw std::runtime_error("ring buffer full");
+    switch (Status) {
+    case Status::None:
+      handleStatusNone();
+      break;
+    case Status::SurfaceAckedConfigure:
+      handleStatusSurfaceAckedConfigure();
+      break;
+    case Status::SurfaceAttached:
+      handleStatusSurfaceAttached();
+      break;
+    }
+
+    int Timeout = (Status == Status::SurfaceAttached) ? FrameDelayMs : -1;
+    bool HasNewMessages = pollEvents(Timeout);
+    if (!HasNewMessages)
+      continue;
 
     ssize_t RecvLen = recv(Fd, Buffer.writePtr(), Buffer.sizeWritable(), 0);
     if (RecvLen == -1)
@@ -406,27 +475,34 @@ void Display::run() {
       throw std::runtime_error("wayland display connection closed");
 
     Buffer.advanceWrite(RecvLen);
+
     while (Buffer.sizeReadable() >= HeaderSize) {
-      uint16_t MsgSizeAnnounced;
-      std::memcpy(&MsgSizeAnnounced, Buffer.readPtr() + MsgSizeOffset,
-                  sizeof(MsgSizeAnnounced));
-      if (Buffer.sizeReadable() < MsgSizeAnnounced)
+      uint16_t MsgSize;
+      std::memcpy(&MsgSize, Buffer.readPtr() + MsgSizeOffset, sizeof(MsgSize));
+      if (Buffer.sizeReadable() < MsgSize)
         break;
 
-      MessageView Msg(Buffer.readPtr(), MsgSizeAnnounced);
-      Buffer.advanceRead(MsgSizeAnnounced);
-
+      MessageView Msg(Buffer.readPtr(), MsgSize);
+      Buffer.advanceRead(MsgSize);
       handleMessage(Msg);
     }
-
-    if (Status == Status::None)
-      handleStatusNone();
-    if (Status == Status::SurfaceAckedConfigure)
-      handleStatusSurfaceAckedConfigure();
   }
 }
 
-// uint32_t wl_get_registry(uint32_t new_id)
+bool Display::pollEvents(int TimeoutMs) {
+  if (Buffer.full())
+    throw std::runtime_error("ring buffer full");
+
+  struct pollfd Pfd = {.fd = Fd, .events = POLLIN, .revents = 0};
+  int Ret = poll(&Pfd, 1, TimeoutMs);
+
+  if (Ret == -1)
+    throw std::system_error(errno, std::generic_category(), "poll failed");
+  if (Ret == 0)
+    return false; // timeout
+  return true;
+}
+
 uint32_t Display::wlGetRegistry() {
   MessageDraft Msg;
   Msg.writeUint(DisplayObjectId);
@@ -628,6 +704,32 @@ void Display::wlSurfaceAttach() {
   if (static_cast<size_t>(Sent) != Msg.size())
     throw std::system_error(errno, std::generic_category(),
                             "failed to send wl_surface attach message");
+}
+
+// void wl_surface_damage(int32_t x, int32_t y, int32_t width, int32_t height)
+void Display::wlSurfaceDamage() {
+  assert(State.WlSurface > 0);
+
+  MessageDraft Msg;
+  Msg.writeUint(State.WlSurface);
+  Msg.writeUint(Opcode::WlSurfaceDamage);
+
+  // calculate message size
+  uint16_t MsgSizeAnnounced = HeaderSize + sizeof(int32_t) * 4;
+  assert(Utils::roundUp4(MsgSizeAnnounced) == MsgSizeAnnounced);
+  Msg.writeUint(MsgSizeAnnounced);
+
+  // damage entire surface
+  Msg.writeUint<int32_t>(0);
+  Msg.writeUint<int32_t>(0);
+  Msg.writeUint<int32_t>(Pixels.width());
+  Msg.writeUint<int32_t>(Pixels.height());
+
+  // send message
+  ssize_t Sent = send(Fd, Msg.data(), Msg.size(), 0);
+  if (static_cast<size_t>(Sent) != Msg.size())
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to send wl_surface damage message");
 }
 
 // void surface_commit()
@@ -872,8 +974,8 @@ void Display::handleStatusNone() {
     return; // already created surface
 
   State.WlSurface = wlCompositorCreateSurface();
-  State.XdgSurface = xdgWmBaseGetXdgSurface();
-  State.XdgToplevel = xdgSurfaceGetToplevel();
+  State.XdgSurface = xdgWmBaseGetXdgSurface(); // not used yet
+  State.XdgToplevel = xdgSurfaceGetToplevel(); // not used yet
   wlSurfaceCommit();
 }
 
@@ -891,25 +993,37 @@ void Display::handleStatusSurfaceAckedConfigure() {
 
   renderFrame();
   wlSurfaceAttach();
+  wlSurfaceDamage();
   wlSurfaceCommit();
   Status = Status::SurfaceAttached;
+}
+
+void Display::handleStatusSurfaceAttached() {
+  assert(Status == Status::SurfaceAttached);
+
+  renderFrame();
+  wlSurfaceAttach(); // maybe unnecessary
+  wlSurfaceDamage();
+  wlSurfaceCommit();
 }
 
 void Display::renderFrame() {
   assert(Pixels.poolData() != nullptr);
   assert(Pixels.poolSize() != 0);
 
+  const auto &Frame = Anim.frame(CurrentFrameIdx);
   uint32_t *PixelData = reinterpret_cast<uint32_t *>(Pixels.poolData());
-  uint32_t Width = Pixels.width();
-  uint32_t Height = Pixels.height();
 
-  // fill with a solid color (blue) for now
-  for (uint32_t I = 0; I < Width * Height; ++I) {
-    uint8_t R = 0x00;
-    uint8_t G = 0x00;
-    uint8_t B = 0xFF;
+  // Convert RGBA to XRGB8888 (Wayland format)
+  size_t PixelCount = Anim.width() * Anim.height();
+  for (size_t I = 0; I < PixelCount; ++I) {
+    uint8_t R = Frame[I * 4 + 0];
+    uint8_t G = Frame[I * 4 + 1];
+    uint8_t B = Frame[I * 4 + 2];
     PixelData[I] = (R << 16) | (G << 8) | B;
   }
+
+  CurrentFrameIdx = (CurrentFrameIdx + 1) % Anim.frameCount();
 }
 
 } // namespace Wayland
