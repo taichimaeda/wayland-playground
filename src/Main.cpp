@@ -77,7 +77,7 @@ Animation::Animation(const std::string &FrameDir, size_t FrameCount) {
     Channels = static_cast<size_t>(C);
 
     size_t DataSize = Width * Height * 4;
-    std::vector<uint8_t> Pixels(Data, Data + DataSize);
+    std::vector<uint8_t> Pixels{Data, Data + DataSize};
     Frames.push_back(std::move(Pixels));
     stbi_image_free(Data);
   }
@@ -87,7 +87,7 @@ namespace Wayland {
 
 class RingBuffer {
 public:
-  RingBuffer() {
+  explicit RingBuffer() {
     size_t PageSize = sysconf(_SC_PAGESIZE);
     Capacity = PageSize; // must be multiple of page size
 
@@ -159,7 +159,8 @@ private:
 
 class MessageView {
 public:
-  MessageView(const char *Data, size_t Size) : Data{Data}, Size{Size}, Pos{0} {}
+  explicit MessageView(const char *Data, size_t Size)
+      : Data{Data}, Size{Size}, Pos{0} {}
 
   template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
   T readUint() {
@@ -194,6 +195,8 @@ private:
 
 class MessageDraft {
 public:
+  explicit MessageDraft() = default;
+
   template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
   void writeUint(T Value) {
     assert(Pos % alignof(T) == 0);
@@ -225,7 +228,7 @@ private:
 
 class SharedMemory {
 public:
-  SharedMemory(size_t Width, size_t Height, size_t Channels);
+  explicit SharedMemory(size_t Width, size_t Height, size_t Channels);
   ~SharedMemory();
 
   SharedMemory(const SharedMemory &) = delete;
@@ -342,8 +345,8 @@ public:
     uint32_t XdgSurface{};
   };
 
-  Display();
-  ~Display();
+  explicit Display();
+  /* virtual */ ~Display();
 
   // prohibit copy/move
   Display(const Display &) = delete;
@@ -407,11 +410,11 @@ Display::Display() {
   char *XdgRuntimeDirEnv = std::getenv("XDG_RUNTIME_DIR");
   if (!XdgRuntimeDirEnv)
     throw std::runtime_error("XDG_RUNTIME_DIR not set");
-  RuntimeDir = std::string(XdgRuntimeDirEnv);
+  RuntimeDir = std::string{XdgRuntimeDirEnv};
 
   char *WaylandDisplayEnv = std::getenv("WAYLAND_DISPLAY");
   DisplayName =
-      WaylandDisplayEnv ? std::string(WaylandDisplayEnv) : "wayland-0";
+      WaylandDisplayEnv ? std::string{WaylandDisplayEnv} : "wayland-0";
 
   // prepare socket path
   std::string SocketPath = RuntimeDir + "/" + DisplayName;
@@ -482,7 +485,7 @@ void Display::run() {
       if (Buffer.sizeReadable() < MsgSize)
         break;
 
-      MessageView Msg(Buffer.readPtr(), MsgSize);
+      MessageView Msg{Buffer.readPtr(), MsgSize};
       Buffer.advanceRead(MsgSize);
       handleMessage(Msg);
     }
@@ -613,25 +616,25 @@ uint32_t Display::wlShmCreatePool() {
   assert(Msg.size() == Utils::roundUp4(Msg.size()));
 
   // send the file descriptor as ancillary data
+  // so that inter-process conversion can happen automatically
   int ShmFd = Pixels.fd();
-  char Buf[CMSG_SPACE(sizeof(ShmFd))]{};
+  char ShmFdBuf[CMSG_SPACE(sizeof(ShmFd))]{};
 
   struct iovec Io = {.iov_base = const_cast<char *>(Msg.data()),
                      .iov_len = Msg.size()};
   struct msghdr SocketMsg = {
       .msg_name = nullptr,
       .msg_namelen = 0,
-      .msg_iov = &Io,
+      .msg_iov = &Io, // regular data (message)
       .msg_iovlen = 1,
-      .msg_control = Buf,
-      .msg_controllen = sizeof(Buf),
+      .msg_control = ShmFdBuf, // ancillary data (file descriptor)
+      .msg_controllen = sizeof(ShmFdBuf),
   };
 
   struct cmsghdr *Cmsg = CMSG_FIRSTHDR(&SocketMsg);
   Cmsg->cmsg_level = SOL_SOCKET;
   Cmsg->cmsg_type = SCM_RIGHTS;
   Cmsg->cmsg_len = CMSG_LEN(sizeof(ShmFd));
-
   *reinterpret_cast<int *>(CMSG_DATA(Cmsg)) = ShmFd;
   SocketMsg.msg_controllen = CMSG_SPACE(sizeof(ShmFd));
 
@@ -1014,7 +1017,7 @@ void Display::renderFrame() {
   const auto &Frame = Anim.frame(CurrentFrameIdx);
   uint32_t *PixelData = reinterpret_cast<uint32_t *>(Pixels.poolData());
 
-  // Convert RGBA to XRGB8888 (Wayland format)
+  // convert RGBA to XRGB8888
   size_t PixelCount = Anim.width() * Anim.height();
   for (size_t I = 0; I < PixelCount; ++I) {
     uint8_t R = Frame[I * 4 + 0];
