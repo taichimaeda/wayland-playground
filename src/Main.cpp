@@ -87,48 +87,8 @@ namespace Wayland {
 
 class RingBuffer {
 public:
-  explicit RingBuffer() {
-    size_t PageSize = sysconf(_SC_PAGESIZE);
-    Capacity = PageSize; // must be multiple of page size
-
-    // allocate underlying memory
-    int Fd = memfd_create("ring-buffer", MFD_CLOEXEC);
-    if (Fd == -1)
-      throw std::system_error(errno, std::generic_category(),
-                              "failed to create ring buffer memfd");
-
-    if (ftruncate(Fd, Capacity) == -1) {
-      close(Fd);
-      throw std::system_error(errno, std::generic_category(),
-                              "failed to size ring buffer");
-    }
-
-    // reserve virtual address space
-    Data = static_cast<char *>(mmap(nullptr, Capacity * 2, PROT_NONE,
-                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (Data == MAP_FAILED) {
-      close(Fd);
-      throw std::system_error(errno, std::generic_category(),
-                              "failed to reserve ring buffer address space");
-    }
-
-    // create magic ring buffer mapping
-    void *First = mmap(Data, Capacity, PROT_READ | PROT_WRITE,
-                       MAP_SHARED | MAP_FIXED, Fd, 0);
-    void *Second = mmap(Data + Capacity, Capacity, PROT_READ | PROT_WRITE,
-                        MAP_SHARED | MAP_FIXED, Fd, 0);
-    close(Fd); // can close fd after mapping
-    if (First == MAP_FAILED || Second == MAP_FAILED) {
-      munmap(Data, Capacity * 2);
-      throw std::system_error(errno, std::generic_category(),
-                              "failed to map ring buffer");
-    }
-  }
-
-  ~RingBuffer() {
-    if (Data)
-      munmap(Data, Capacity * 2);
-  }
+  explicit RingBuffer();
+  /* virtual */ ~RingBuffer();
 
   // prohibit copy/move
   RingBuffer(const RingBuffer &) = delete;
@@ -156,6 +116,49 @@ private:
   size_t Head{0}; // next write position
   size_t Tail{0}; // next read position
 };
+
+RingBuffer::RingBuffer() {
+  size_t PageSize = sysconf(_SC_PAGESIZE);
+  Capacity = PageSize; // must be multiple of page size
+
+  // allocate underlying memory
+  int Fd = memfd_create("ring-buffer", MFD_CLOEXEC);
+  if (Fd == -1)
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to create ring buffer memfd");
+
+  if (ftruncate(Fd, Capacity) == -1) {
+    close(Fd);
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to size ring buffer");
+  }
+
+  // reserve virtual address space
+  Data = static_cast<char *>(mmap(nullptr, Capacity * 2, PROT_NONE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (Data == MAP_FAILED) {
+    close(Fd);
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to reserve ring buffer address space");
+  }
+
+  // create magic ring buffer mapping
+  void *First = mmap(Data, Capacity, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_FIXED, Fd, 0);
+  void *Second = mmap(Data + Capacity, Capacity, PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_FIXED, Fd, 0);
+  close(Fd); // can close fd after mapping
+  if (First == MAP_FAILED || Second == MAP_FAILED) {
+    munmap(Data, Capacity * 2);
+    throw std::system_error(errno, std::generic_category(),
+                            "failed to map ring buffer");
+  }
+}
+
+RingBuffer::~RingBuffer() {
+  if (Data)
+    munmap(Data, Capacity * 2);
+}
 
 class MessageView {
 public:
@@ -229,7 +232,7 @@ private:
 class SharedMemory {
 public:
   explicit SharedMemory(size_t Width, size_t Height, size_t Channels);
-  ~SharedMemory();
+  /* virtual */ ~SharedMemory();
 
   SharedMemory(const SharedMemory &) = delete;
   SharedMemory &operator=(const SharedMemory &) = delete;
